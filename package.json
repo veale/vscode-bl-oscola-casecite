@@ -1,0 +1,96 @@
+{
+  "name": "casecite",
+  "displayName": "CaseCite — UK & EU Case Law for BibLaTeX",
+  "description": "Search UK (National Archives) and EU (CELLAR/EUR-Lex) case law and insert @jurisdiction biblatex entries with OSCOLA-compatible formatting.",
+  "version": "0.1.0",
+  "publisher": "your-publisher-id",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./src/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "casecite",
+          "title": "CaseCite",
+          "icon": "$(law)"
+        }
+      ]
+    },
+    "views": {
+      "casecite": [
+        {
+          "type": "webview",
+          "id": "casecite.sidebarView",
+          "name": "Case Search"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "casecite.focusSearch",
+        "title": "CaseCite: Focus search"
+      },
+      {
+        "command": "casecite.lookupUK",
+        "title": "CaseCite: Look up UK case"
+      },
+      {
+        "command": "casecite.lookupEU",
+        "title": "CaseCite: Look up EU case"
+      },
+      {
+        "command": "casecite.cacheExport",
+        "title": "CaseCite: Export cache to .bib"
+      },
+      {
+        "command": "casecite.cacheClear",
+        "title": "CaseCite: Clear cache"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "casecite.focusSearch",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c"
+      }
+    ],
+    "configuration": {
+      "title": "CaseCite",
+      "properties": {
+        "casecite.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Path to the Python interpreter."
+        },
+        "casecite.defaultBibFile": {
+          "type": "string",
+          "default": "",
+          "description": "Default .bib file to append entries to. Leave blank to insert at cursor."
+        },
+        "casecite.cacheDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory for the case cache (default: ~/.casecite/)."
+        },
+        "casecite.autoCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically cache every looked-up case."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "eslint src --ext js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "eslint": "^8.0.0"
+  }
+}
