@@ -98,14 +98,19 @@ class CaseCiteSidebarProvider {
       const result = await this._runScript(["search", query.trim(), "--limit", "15"]);
       // Enrich with source labels
       const items = [];
-      if (filter !== "eu" && result.uk) {
+      if (filter !== "eu" && filter !== "euleg" && result.uk) {
         for (const r of result.uk) {
           items.push({ ...r, source: "uk" });
         }
       }
-      if (filter !== "uk" && result.eu) {
+      if (filter !== "uk" && filter !== "euleg" && result.eu) {
         for (const r of result.eu) {
           items.push({ ...r, source: "eu" });
+        }
+      }
+      if (filter !== "uk" && filter !== "eu" && result.euleg) {
+        for (const r of result.euleg) {
+          items.push({ ...r, source: "euleg" });
         }
       }
       this._postMessage({ type: "searchResults", items, query });
@@ -267,6 +272,12 @@ class CaseCiteSidebarProvider {
     font-weight: 600;
     line-height: 1.3;
   }
+  .result-card.euleg-card .result-title {
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
   .result-meta {
     font-size: 11px;
     color: var(--vscode-descriptionForeground);
@@ -299,6 +310,16 @@ class CaseCiteSidebarProvider {
   .source-badge.ag {
     background: var(--vscode-charts-purple, #9d4edd);
     color: var(--vscode-editor-background);
+  }
+  .source-badge.euleg {
+    background: var(--vscode-charts-orange, #e5a00d);
+    color: var(--vscode-editor-background);
+  }
+  .source-badge.type-tag {
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    font-weight: 400;
+    text-transform: capitalize;
   }
 
   /* Detail panel */
@@ -468,11 +489,12 @@ class CaseCiteSidebarProvider {
 
 <div class="search-box">
   <input class="search-input" id="searchInput" type="text"
-         placeholder="Search UK &amp; EU cases..." />
+         placeholder="Search UK &amp; EU cases &amp; legislation..." />
   <div class="filter-tabs">
     <button class="filter-tab active" data-filter="all">All</button>
     <button class="filter-tab" data-filter="uk">UK</button>
-    <button class="filter-tab" data-filter="eu">EU</button>
+    <button class="filter-tab" data-filter="eu">EU Cases</button>
+    <button class="filter-tab" data-filter="euleg">EU Leg</button>
     <button class="filter-tab" data-filter="cache">Cache</button>
   </div>
 </div>
@@ -530,17 +552,35 @@ function renderResults(items, query) {
   el.innerHTML = items.map((r, i) => {
     let badge = r.source === "uk"
       ? '<span class="source-badge uk">UK</span>'
+      : r.source === "euleg"
+      ? '<span class="source-badge euleg">Leg</span>'
       : '<span class="source-badge eu">EU</span>';
     if (r.is_ag_opinion) {
       badge += ' <span class="source-badge ag">AG</span>';
     }
-    const meta = r.source === "uk"
-      ? (r.citation || r.uri || "") + " · " + (r.date || "")
-      : (r.case_number || r.celex || "") + " · " + (r.date || "");
+    if (r.source === "euleg" && r.instrument_type) {
+      badge += ' <span class="source-badge type-tag">' + escHtml(r.instrument_type) + '</span>';
+    }
+    var meta;
+    if (r.source === "uk") {
+      meta = (r.citation || r.uri || "") + " · " + (r.date || "");
+    } else if (r.source === "euleg") {
+      meta = (r.celex || "") + " · " + (r.date || "");
+      if (r.in_force === true) meta += " · in force";
+      else if (r.in_force === false) meta += " · not in force";
+    } else {
+      meta = (r.case_number || r.celex || "") + " · " + (r.date || "");
+    }
     const title = r.title || r.celex || r.uri || "Untitled";
-    const shortTitle = title.length > 80 ? title.slice(0, 77) + "..." : title;
-    return '<div class="result-card" data-idx="' + i + '">'
-      + '<div class="result-title">' + badge + " " + escHtml(shortTitle) + "</div>"
+    var displayTitle;
+    if (r.source === "euleg") {
+      displayTitle = shortenLegTitle(title);
+    } else {
+      displayTitle = title.length > 80 ? title.slice(0, 77) + "..." : title;
+    }
+    var cardClass = "result-card" + (r.source === "euleg" ? " euleg-card" : "");
+    return '<div class="' + cardClass + '" data-idx="' + i + '">'
+      + '<div class="result-title">' + badge + " " + escHtml(displayTitle) + "</div>"
       + '<div class="result-meta">' + escHtml(meta) + "</div>"
       + "</div>";
   }).join("");
@@ -580,6 +620,8 @@ function selectResult(idx) {
     } else {
       query = r.uri;
     }
+  } else if (source === "euleg") {
+    query = r.celex;
   } else {
     query = r.celex || r.case_number;
   }
@@ -714,6 +756,29 @@ function escHtml(s) {
 }
 function escAttr(s) {
   return (s || "").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+function shortenLegTitle(title) {
+  // Strip institutional boilerplate from EU legislation titles to show the
+  // actual subject matter. Removes patterns like:
+  //   "of the European Parliament and of the Council"
+  //   "of DD Month YYYY" (the date in the title)
+  //   "(Text with EEA relevance)"
+  // Keeps the instrument type + number prefix and the substantive description.
+  var s = title;
+  // Remove "(Text with EEA relevance)" or similar parenthetical notes at end
+  s = s.replace(/\s*\(Text with \w+ relevance\)\s*/gi, "");
+  // Remove "of the European Parliament and of the Council" (with optional "of the European Union")
+  s = s.replace(/\s+of the European Parliament and of the Council/gi, "");
+  s = s.replace(/\s+of the Council of the European Union/gi, "");
+  s = s.replace(/\s+of the Council/gi, function(match, offset) {
+    // Only strip if it appears after the instrument number, not in the subject matter
+    return offset < 80 ? "" : match;
+  });
+  // Remove the date phrase "of DD Month(s) YYYY" that follows the number
+  s = s.replace(/\s+of\s+\d{1,2}\s+\w+\s+\d{4}/i, "");
+  // Clean up double spaces
+  s = s.replace(/\s{2,}/g, " ").trim();
+  return s;
 }
 </script>
 

@@ -23,6 +23,7 @@ It communicates via JSON on stdout when --json is passed.
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -50,13 +52,21 @@ EURLEX_SEARCH = "https://eur-lex.europa.eu/search.html"
 CELLAR_BASE = "https://publications.europa.eu/resource/celex"
 
 # Map National Archives court paths to (base_court, division) tuples.
-# For EWHC/UKUT, the neutral citation format is [year] EWHC number (Division),
+# For EWHC/UKUT/UKFTT, the neutral citation format is [year] COURT number (Division),
 # i.e. the division comes AFTER the number.
+# For EWCA, the division comes BEFORE: [year] EWCA Civ number.
+#
+# Sources: Practice Direction [2001] 1 WLR 194; Practice Direction [2002] 1 WLR 346;
+# Practice Statement (Tribunals) 31 Oct 2008; Inner Temple Library neutral citation list;
+# National Archives court codes; Zotero translator by Michael Veale.
 COURT_MAP = {
+    # Supreme Court / Privy Council
     "uksc": ("UKSC", None),
     "ukpc": ("UKPC", None),
+    # Court of Appeal (E&W)
     "ewca/civ": ("EWCA Civ", None),
     "ewca/crim": ("EWCA Crim", None),
+    # High Court (E&W) — division after number
     "ewhc/admin": ("EWHC", "Admin"),
     "ewhc/admlty": ("EWHC", "Admlty"),
     "ewhc/ch": ("EWHC", "Ch"),
@@ -70,13 +80,48 @@ COURT_MAP = {
     "ewhc/pat": ("EWHC", "Pat"),
     "ewhc/scco": ("EWHC", "SCCO"),
     "ewhc/tcc": ("EWHC", "TCC"),
+    # Specialist E&W courts
+    "ewfc": ("EWFC", None),
+    "ewcop": ("EWCOP", None),
+    "ewcc": ("EWCC", None),
+    # Upper Tribunal — chamber after number
+    "ukut/aac": ("UKUT", "AAC"),
     "ukut/iac": ("UKUT", "IAC"),
     "ukut/lc": ("UKUT", "LC"),
     "ukut/tcc": ("UKUT", "TCC"),
-    "ukut/aac": ("UKUT", "AAC"),
+    # First-tier Tribunal — chamber after number
+    "ukftt/grc": ("UKFTT", "GRC"),
+    "ukftt/tc": ("UKFTT", "TC"),
+    "ukftt/iac": ("UKFTT", "IAC"),
+    "ukftt/hesc": ("UKFTT", "HESC"),
+    "ukftt/sec": ("UKFTT", "SEC"),
+    "ukftt/pc": ("UKFTT", "PC"),
+    "ukftt/rpv": ("UKFTT", "RPV"),
+    "ukftt/wp": ("UKFTT", "WP"),
+    "ukftt/wpafcc": ("UKFTT", "WPAFCC"),
+    # Other E&W tribunals
     "eat": ("EAT", None),
-    "ewfc": ("EWFC", None),
-    "ewcc": ("EWCC", None),
+    "cat": ("CAT", None),
+    "ukiptrib": ("UKIPTrib", None),
+    "uksiac": ("UKSIAC", None),
+    # Northern Ireland
+    "nica": ("NICA", None),
+    "nikb": ("NIKB", None),
+    "niqb": ("NIQB", None),
+    "nich": ("NICh", None),
+    "nifam": ("NIFam", None),
+    "nicc": ("NICC", None),
+    "nimaster": ("NIMaster", None),
+    # Scotland
+    "csih": ("CSIH", None),
+    "csoh": ("CSOH", None),
+    "hcj": ("HCJ", None),
+    "sac": ("SAC", None),
+    # Historic
+    "ukist": ("UKIST", None),
+    "ukccat": ("UKCCAT", None),
+    "ukcmst": ("UKCMST", None),
+    "uktr": ("UKTr", None),
 }
 
 # EU court codes from CELLAR to readable institution names
@@ -257,14 +302,20 @@ def _parse_neutral_citation(cite: str) -> Optional[dict]:
     Parse a neutral citation like [2017] EWCA Civ 121 into components.
     Returns dict with year, court_path, number or None.
     """
-    # Match patterns like [2017] EWCA Civ 121 or [2006] EWHC 1201 (Admin)
+    # Match neutral citations for all UK courts and tribunals.
+    # Format: [year] COURT number or [year] COURT number (Division)
+    # EWCA has division before number: [year] EWCA Civ number
+    #
+    # The regex is permissive: it matches any uppercase letters as the court
+    # abbreviation, with an optional word after (for EWCA Civ/Crim), then
+    # digits, then an optional parenthesised division. This means new courts
+    # are automatically supported even if not in COURT_MAP.
     m = re.match(
         r'\[(\d{4})\]\s+'
-        r'(UKSC|UKPC|EWCA\s+(?:Civ|Crim)|EWHC|UKUT|EAT|EWFC|EWCC)'
+        r'([A-Z][A-Za-z]+(?:\s+[A-Z][a-z]+)?)'  # court + optional division word (EWCA Civ)
         r'\s+(\d+)'
-        r'(?:\s*\((\w+)\))?',
+        r'(?:\s*\(([A-Za-z0-9]+)\))?',           # optional (Division) suffix
         cite.strip(),
-        re.IGNORECASE,
     )
     if not m:
         return None
@@ -565,29 +616,18 @@ LIMIT 1
 SEARCH_QUERY = """
 PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 
-SELECT DISTINCT ?celex ?ecli ?date ?title ?short_parties ?caseNumber ?resource_type
+SELECT DISTINCT ?celex ?ecli ?date ?title ?short_parties ?caseNumber
 WHERE {{
   ?work cdm:resource_legal_id_celex ?celex .
   FILTER(REGEX(STR(?celex), "^6[0-9]{{4}}(CJ|TJ|FJ|CC)"))
   ?expr cdm:expression_belongs_to_work ?work ;
-        cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .
-  OPTIONAL {{ ?expr cdm:expression_title ?title . }}
+        cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> ;
+        cdm:expression_title ?title .
   OPTIONAL {{ ?expr cdm:expression_case-law_parties ?short_parties . }}
-  {{
-    ?expr cdm:expression_title ?searchText .
-    FILTER(CONTAINS(LCASE(STR(?searchText)), "{search_lower}"))
-  }} UNION {{
-    ?expr cdm:expression_case-law_parties ?searchParties .
-    FILTER(CONTAINS(LCASE(STR(?searchParties)), "{search_lower}"))
-  }} UNION {{
-    ?expr cdm:expression_case-law_indicator_decision ?searchHeadnote .
-    FILTER(CONTAINS(LCASE(STR(?searchHeadnote)), "{search_lower}"))
-  }}
+  FILTER(CONTAINS(LCASE(STR(?title)), "{search_lower}"))
   OPTIONAL {{ ?work cdm:case-law_ecli ?ecli . }}
   OPTIONAL {{ ?work cdm:work_date_document ?date . }}
   OPTIONAL {{ ?work cdm:resource_legal_number_natural_celex ?caseNumber . }}
-  OPTIONAL {{ ?work cdm:work_has_resource-type ?rtUri .
-              BIND(REPLACE(STR(?rtUri), "^.*/", "") AS ?resource_type) }}
 }}
 ORDER BY DESC(?date)
 LIMIT {limit}
@@ -612,7 +652,8 @@ def _sparql_query(query: str) -> list:
             data = json.loads(resp.read().decode("utf-8"))
         bindings = data.get("results", {}).get("bindings", [])
         return bindings
-    except Exception:
+    except Exception as e:
+        print(f"CELLAR SPARQL error: {e}", file=sys.stderr)
         return []
 
 
@@ -755,13 +796,33 @@ def eu_lookup_by_celex(celex: str) -> Optional[dict]:
 def eu_search(query: str, limit: int = 10) -> list:
     """Search EU case law by keyword (includes AG opinions).
     
-    If query looks like a case number (C-21/23), does a direct CELEX
+    If query looks like a case number, CELEX, or ECLI, does a direct
     lookup instead of a slow text search.
     """
-    # Shortcut: if query looks like a case number, convert to CELEX and do direct lookup
-    case_num_match = re.match(r'^[CT][_-]?\d+/\d{2,4}(?:\s*P)?$', query.strip(), re.IGNORECASE)
+    query_stripped = query.strip()
+
+    # Shortcut: direct CELEX (starts with 6 + 4 digits + court suffix)
+    if re.match(r'^6\d{4}[A-Z]', query_stripped):
+        result = eu_lookup_by_celex(query_stripped)
+        if result:
+            return [result]
+        return []
+
+    # Shortcut: ECLI
+    ecli_match = re.match(r'(?:ECLI:)?(EU:[CT]:\d{4}:\d+)', query_stripped, re.IGNORECASE)
+    if ecli_match:
+        ecli = ecli_match.group(1)
+        celex = _celex_from_ecli(ecli)
+        if celex:
+            result = eu_lookup_by_celex(celex)
+            if result:
+                return [result]
+        return []
+
+    # Shortcut: case number (C-21/23, T-123/20, etc.)
+    case_num_match = re.match(r'^[CT][_-]?\d+/\d{2,4}(?:\s*P)?$', query_stripped, re.IGNORECASE)
     if case_num_match:
-        celex = _celex_from_case_number(query.strip())
+        celex = _celex_from_case_number(query_stripped)
         if celex:
             result = eu_lookup_by_celex(celex)
             if result:
@@ -789,7 +850,6 @@ def eu_search(query: str, limit: int = 10) -> list:
         title_raw = r.get("title", {}).get("value", "")
         short_parties = r.get("short_parties", {}).get("value", "")
         case_num = r.get("caseNumber", {}).get("value", "")
-        resource_type = r.get("resource_type", {}).get("value", "")
 
         # Prefer the short parties field if available
         if short_parties:
@@ -805,7 +865,7 @@ def eu_search(query: str, limit: int = 10) -> list:
         if ecli.startswith("ECLI:"):
             ecli = ecli[5:]
 
-        is_ag = ("CC" in celex) or (resource_type == "OPIN_AG")
+        is_ag = "CC" in celex
 
         cases.append({
             "celex": celex,
@@ -902,15 +962,451 @@ def eu_to_biblatex(case: dict, cite_key: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# EU Legislation (CELLAR SPARQL — directives, regulations, decisions, treaties)
+# ---------------------------------------------------------------------------
+
+# Resource-type URIs from the Publications Office Named Authority List.
+# These match the filters used by the eurlex R package (michalovadek/eurlex).
+EU_LEG_TYPES = {
+    "directive": [
+        "http://publications.europa.eu/resource/authority/resource-type/DIR",
+        "http://publications.europa.eu/resource/authority/resource-type/DIR_IMPL",
+        "http://publications.europa.eu/resource/authority/resource-type/DIR_DEL",
+    ],
+    "regulation": [
+        "http://publications.europa.eu/resource/authority/resource-type/REG",
+        "http://publications.europa.eu/resource/authority/resource-type/REG_IMPL",
+        "http://publications.europa.eu/resource/authority/resource-type/REG_FINANC",
+        "http://publications.europa.eu/resource/authority/resource-type/REG_DEL",
+    ],
+    "decision": [
+        "http://publications.europa.eu/resource/authority/resource-type/DEC",
+        "http://publications.europa.eu/resource/authority/resource-type/DEC_IMPL",
+        "http://publications.europa.eu/resource/authority/resource-type/DEC_DEL",
+        "http://publications.europa.eu/resource/authority/resource-type/DEC_ENTSCHEID",
+    ],
+    "treaty": [],  # treaties use sector 1 CELEX, handled separately
+}
+
+# Combine all for "any" searches
+EU_LEG_ALL_TYPES = []
+for _types in EU_LEG_TYPES.values():
+    EU_LEG_ALL_TYPES.extend(_types)
+
+
+def _build_type_filter(leg_type: str = "any") -> str:
+    """Build a SPARQL FILTER clause for EU legislation resource types."""
+    if leg_type == "treaty":
+        # Treaties are CELEX sector 1, not filtered by resource-type
+        return 'FILTER(REGEX(STR(?celex), "^1"))'
+    types = EU_LEG_TYPES.get(leg_type, EU_LEG_ALL_TYPES) if leg_type != "any" else EU_LEG_ALL_TYPES
+    if not types:
+        return ""
+    conditions = " || ".join(f'?type = <{t}>' for t in types)
+    return f"FILTER({conditions})"
+
+
+def eu_legislation_search(query: str, leg_type: str = "any", limit: int = 15) -> list:
+    """
+    Search EU legislation via CELLAR SPARQL.
+
+    leg_type: 'any', 'directive', 'regulation', 'decision', 'treaty'
+
+    Uses a lightweight SPARQL query (CELEX sector filter + title CONTAINS only,
+    no resource-type joins) to avoid CELLAR timeouts on text searches.
+    Instrument type is determined from the CELEX descriptor after the fact.
+    """
+    query = query.strip()
+
+    # Fast path: if query looks like a CELEX number, do a direct lookup
+    if re.match(r'^[31]\d{4}[A-Z]', query):
+        leg = eu_legislation_lookup(query)
+        if leg:
+            return [leg]
+        return []
+
+    query_escaped = query.lower().replace('"', '\\"')
+
+    # Determine CELEX sector filter
+    if leg_type == "treaty":
+        celex_filter = 'FILTER(REGEX(STR(?celex), "^1"))'
+    else:
+        # Sector 3 = legislation. Optionally narrow by descriptor letter.
+        descriptor_map = {
+            "directive": "L",
+            "regulation": "R",
+            "decision": "D",
+        }
+        descriptor = descriptor_map.get(leg_type)
+        if descriptor:
+            celex_filter = f'FILTER(REGEX(STR(?celex), "^3\\\\d{{4}}{descriptor}"))'
+        else:
+            celex_filter = 'FILTER(REGEX(STR(?celex), "^3"))'
+
+    # Lightweight query: no resource-type joins, no corrigendum filter,
+    # no optional OJ fields — just CELEX + title + date.
+    # This is fast because CELLAR can use its CELEX index + text scan.
+    sparql = f"""
+PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+SELECT DISTINCT ?celex ?date ?title
+WHERE {{
+  ?work cdm:resource_legal_id_celex ?celex .
+  {celex_filter}
+  ?expr cdm:expression_belongs_to_work ?work ;
+        cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> ;
+        cdm:expression_title ?title .
+  FILTER(CONTAINS(LCASE(STR(?title)), "{query_escaped}"))
+  OPTIONAL {{ ?work cdm:work_date_document ?date . }}
+}}
+ORDER BY DESC(?date)
+LIMIT {limit}
+"""
+
+    results = _sparql_query(sparql)
+    seen = set()
+    items = []
+    for r in results:
+        celex = r.get("celex", {}).get("value", "")
+        if celex in seen:
+            continue
+        seen.add(celex)
+        # Skip corrigenda (CELEX contains "R(" suffix)
+        if "R(" in celex:
+            continue
+        title = r.get("title", {}).get("value", "")
+        date = r.get("date", {}).get("value", "")
+
+        # Determine the instrument type from CELEX descriptor
+        instr_type = _celex_to_instrument_type(celex)
+
+        items.append({
+            "celex": celex,
+            "title": title,
+            "date": date[:10] if date else "",
+            "instrument_type": instr_type,
+            "in_force": None,  # Not queried to keep SPARQL fast
+            "source": "euleg",
+        })
+    return items
+
+
+def _celex_to_instrument_type(celex: str) -> str:
+    """Determine instrument type from CELEX number descriptor letter."""
+    if len(celex) < 6:
+        return "legislation"
+    descriptor = celex[5:6]  # The letter(s) after the 4-digit year
+    mapping = {
+        "L": "directive",
+        "R": "regulation",
+        "D": "decision",
+        "E": "treaty",
+        "M": "treaty",  # TEU/TFEU consolidated
+    }
+    # Check sector 1 for treaties
+    if celex.startswith("1"):
+        return "treaty"
+    return mapping.get(descriptor, "legislation")
+
+
+def _extract_instrument_number(title: str, celex: str) -> str:
+    """
+    Extract the instrument number from the title.
+    E.g. from "Council Directive 2002/60/EC ..." → "2002/60/EC"
+    E.g. from "Regulation (EU) 2016/679 ..." → "2016/679"
+    """
+    # Try patterns like 2016/679, 2002/60/EC, No 593/2008
+    m = re.search(r'(?:No\s+)?(\d{2,4}/\d+(?:/\w+)?)', title)
+    if m:
+        return m.group(1)
+    # Try pattern like (EU) 2024/1689
+    m = re.search(r'\((?:EU|EC|EEC)\)\s+(\d{4}/\d+)', title)
+    if m:
+        return m.group(1)
+    # Fall back to the CELEX number's trailing digits
+    if len(celex) > 6:
+        num_part = celex[6:]
+        return num_part.lstrip("0") or num_part
+    return ""
+
+
+def _extract_oj_from_title(title: str) -> dict:
+    """
+    Try to extract OJ reference from the instrument title.
+    Many titles don't contain it — it's in the metadata.
+    Returns dict with journaltitle, series, volume, pages (all may be empty).
+    """
+    # OJ references are usually not in the title, but in metadata
+    # We'll get them from CELLAR metadata or EUR-Lex
+    return {"journaltitle": "", "series": "", "volume": "", "pages": ""}
+
+
+def eu_legislation_lookup(celex: str) -> Optional[dict]:
+    """
+    Look up a specific EU legislative act by CELEX number.
+    Returns metadata for biblatex @legislation entry.
+    """
+    # Get title and date from CELLAR
+    sparql = f"""
+PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+SELECT ?title ?date ?force ?oj_id
+WHERE {{
+  ?work cdm:resource_legal_id_celex ?celex_val .
+  FILTER(STR(?celex_val) = "{celex}")
+  ?expr cdm:expression_belongs_to_work ?work ;
+        cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> ;
+        cdm:expression_title ?title .
+  OPTIONAL {{ ?work cdm:work_date_document ?date . }}
+  OPTIONAL {{ ?work cdm:resource_legal_in-force ?force . }}
+  OPTIONAL {{ ?work cdm:work_part_of_work ?oj .
+              ?oj cdm:resource_legal_id_celex ?oj_id .
+              FILTER(REGEX(STR(?oj_id), "^C")) }}
+}}
+LIMIT 1
+"""
+    results = _sparql_query(sparql)
+    if not results:
+        return None
+
+    r = results[0]
+    title = r.get("title", {}).get("value", "")
+    date = r.get("date", {}).get("value", "")
+    force = r.get("force", {}).get("value", "")
+
+    instr_type = _celex_to_instrument_type(celex)
+    number = _extract_instrument_number(title, celex)
+
+    # Try to get OJ reference from a separate SPARQL query
+    oj = _fetch_oj_reference(celex)
+
+    return {
+        "celex": celex,
+        "title": title,
+        "date": date[:10] if date else "",
+        "instrument_type": instr_type,
+        "number": number,
+        "in_force": force.lower() == "true" if force else None,
+        "oj_journal": oj.get("journal", "OJ"),
+        "oj_series": oj.get("series", ""),
+        "oj_volume": oj.get("volume", ""),
+        "oj_pages": oj.get("pages", ""),
+        "source": "euleg",
+    }
+
+
+def _fetch_oj_reference(celex: str) -> dict:
+    """
+    Get Official Journal reference for EU legislation.
+
+    Uses a layered strategy tested against real CELLAR data:
+      1. Formex XML (most reliable — contains structured OJ metadata)
+         - formex-05 (pre-2023): <PUBLICATION.REF> has <COLL>, <NO.OJ>;
+           <DOC.MAIN.PUB> has <PAGE.FIRST>
+         - formex-06 (2024+): <BIB.OJ> has <COLL>; NO per-document page
+           numbers exist (new OJ format dropped them — OSCOLA says to omit
+           pages and volume for these issues)
+      2. CELEX descriptor fallback (always works for series letter)
+
+    Returns dict with journal, series, volume, pages (any may be empty).
+    """
+    empty = {"journal": "OJ", "series": "", "volume": "", "pages": ""}
+
+    # ----- Strategy 1: Formex XML -----
+    try:
+        formex_url = f"https://publications.europa.eu/resource/celex/{celex}"
+        req = urllib.request.Request(
+            formex_url,
+            headers={
+                "Accept": "application/zip;mtype=fmx4",
+                "Accept-Language": "eng",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status == 200:
+                data = resp.read()
+                zf = zipfile.ZipFile(io.BytesIO(data))
+                xml_text = None
+                for name in zf.namelist():
+                    if name.endswith((".xml", ".fmx", ".fmx4")):
+                        xml_text = zf.read(name).decode("utf-8", errors="replace")
+                        break
+                if not xml_text:
+                    # Zip had no XML — fall through to strategy 2
+                    raise ValueError("No XML in zip")
+
+                root = ET.fromstring(xml_text)
+                oj = _parse_formex_oj(root)
+                if oj["series"]:
+                    return oj
+    except Exception:
+        pass  # Formex unavailable (treaties, very old docs) — fall through
+
+    # ----- Strategy 2: CELEX descriptor fallback -----
+    # The CELEX descriptor letter tells us the OJ series:
+    #   L-series = Directives, Regulations, Decisions (descriptor L, R, D)
+    #   C-series = resolutions, opinions, etc.
+    # Sector 1 (treaties) → C series; Sector 3 → usually L
+    series = _celex_to_oj_series(celex)
+    return {"journal": "OJ", "series": series, "volume": "", "pages": ""}
+
+
+def _parse_formex_oj(root: ET.Element) -> dict:
+    """
+    Extract OJ reference from a Formex XML root element.
+    Handles both formex-05 (<PUBLICATION.REF>) and formex-06 (<BIB.OJ>).
+    """
+    result = {"journal": "OJ", "series": "", "volume": "", "pages": ""}
+
+    # ----- formex-05 style: <PUBLICATION.REF> with <COLL>, <NO.OJ> -----
+    pub_ref = root.find(".//PUBLICATION.REF")
+    if pub_ref is not None:
+        coll_el = pub_ref.find("COLL")
+        oj_el = pub_ref.find("NO.OJ")
+        if coll_el is not None and coll_el.text:
+            result["series"] = coll_el.text.strip()
+        if oj_el is not None and oj_el.text:
+            # NO.OJ may be zero-padded like "094" — strip leading zeros
+            vol = oj_el.text.strip().lstrip("0") or "0"
+            result["volume"] = vol
+
+        # Page comes from <DOC.MAIN.PUB><PAGE.FIRST>
+        main_pub = root.find(".//DOC.MAIN.PUB")
+        if main_pub is not None:
+            page_el = main_pub.find("PAGE.FIRST")
+            if page_el is not None and page_el.text:
+                result["pages"] = page_el.text.strip()
+
+        return result
+
+    # ----- formex-06 style: <BIB.OJ> with <COLL> -----
+    # Post-2023 OJ format: no issue numbers, no per-document page numbers.
+    # OSCOLA says to omit pages and volume in this case — just give series.
+    bib_oj = root.find(".//BIB.OJ")
+    if bib_oj is not None:
+        coll_el = bib_oj.find("COLL")
+        if coll_el is not None and coll_el.text:
+            result["series"] = coll_el.text.strip()
+        # volume and pages deliberately left empty — new OJ format
+        return result
+
+    # ----- Fallback within Formex: look for <COLL> anywhere -----
+    coll_el = root.find(".//COLL")
+    if coll_el is not None and coll_el.text:
+        result["series"] = coll_el.text.strip()
+
+    return result
+
+
+def _celex_to_oj_series(celex: str) -> str:
+    """
+    Infer OJ series letter from CELEX number.
+    Sector 3 legislation is almost always L-series.
+    Sector 1 treaties are C-series.
+    """
+    if celex.startswith("1"):
+        return "C"
+    if celex.startswith("3"):
+        return "L"
+    return ""
+
+
+def eu_legislation_to_biblatex(leg: dict, cite_key: str = "") -> str:
+    """
+    Convert EU legislation dict to @legislation biblatex entry.
+
+    Follows OSCOLA / biblatex-oscola format as documented:
+    - title: full title including number and enacting institution
+    - type: directive / regulation / decision (lowercase)
+    - number: instrument number (e.g. 2002/60/EC)
+    - journaltitle: OJ
+    - series: L or C
+    - volume: OJ issue number
+    - pages: starting page
+    - date: year of publication
+    - keywords: eu
+    - pagination: article (for article-level pinpoints)
+    - entrysubtype: directive / regulation / decision (for indexing)
+    """
+    title = leg.get("title", "")
+    date = leg.get("date", "")
+    instr_type = leg.get("instrument_type", "")
+    number = leg.get("number", "")
+    oj_journal = leg.get("oj_journal", "OJ")
+    oj_series = leg.get("oj_series", "")
+    oj_volume = leg.get("oj_volume", "")
+    oj_pages = leg.get("oj_pages", "")
+    celex = leg.get("celex", "")
+
+    if not cite_key:
+        # For legislation, use the number as cite key base
+        if number:
+            cite_key = re.sub(r'[^a-zA-Z0-9]', '', number)
+            if not cite_key:
+                cite_key = _sanitise_key(title)
+        else:
+            cite_key = _sanitise_key(title)
+
+    safe_title = _escape_bibtex(title)
+    year = date[:4] if date else ""
+
+    lines = [
+        f"@legislation{{{cite_key},",
+        f"\ttitle = {{{safe_title}}},",
+        f"\tdate = {{{year}}},",
+    ]
+
+    if instr_type and instr_type not in ("legislation", "treaty"):
+        lines.append(f"\ttype = {{{instr_type}}},")
+        lines.append(f"\tentrysubtype = {{{instr_type}}},")
+
+    if instr_type == "treaty":
+        lines.append(f"\tentrysubtype = {{eu-treaty}},")
+
+    if number:
+        lines.append(f"\tnumber = {{{number}}},")
+
+    lines.append(f"\tjournaltitle = {{{oj_journal}}},")
+
+    if oj_series:
+        lines.append(f"\tseries = {{{oj_series}}},")
+
+    if oj_volume:
+        lines.append(f"\tissue = {{{oj_volume}}},")
+    # Note: newer OJ issues don't have page numbers — omit if absent per OSCOLA
+    if oj_pages:
+        lines.append(f"\tpages = {{{oj_pages}}},")
+
+    lines.append(f"\tkeywords = {{eu}},")
+    lines.append(f"\tpagination = {{article}},")
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Unified interface
 # ---------------------------------------------------------------------------
 
 def lookup_and_format(source: str, query: str, cite_key: str = "") -> Optional[str]:
     """
     Look up a case and return a formatted biblatex entry.
-    source: 'uk', 'eu', or 'auto'
+    source: 'uk', 'eu', 'euleg', or 'auto'
     """
     case = None
+
+    # EU legislation lookup
+    if source == "euleg":
+        # If query looks like a CELEX (starts with 3 or 1 + 4 digits)
+        if re.match(r'^[31]\d{4}', query.strip()):
+            leg = eu_legislation_lookup(query.strip())
+            if leg:
+                return eu_legislation_to_biblatex(leg, cite_key)
+        # Otherwise, search and return first result
+        results = eu_legislation_search(query, limit=5)
+        if results:
+            leg = eu_legislation_lookup(results[0]["celex"])
+            if leg:
+                return eu_legislation_to_biblatex(leg, cite_key)
+        return None
 
     if source in ("uk", "auto"):
         # Try as neutral citation first
@@ -988,6 +1484,10 @@ def main():
     eu_parser = subparsers.add_parser("eu", help="Look up an EU case")
     eu_parser.add_argument("query", help="Case number, CELEX, or ECLI")
 
+    # euleg subcommand
+    euleg_parser = subparsers.add_parser("euleg", help="Look up EU legislation")
+    euleg_parser.add_argument("query", help="CELEX number or search terms")
+
     # search subcommand
     search_parser = subparsers.add_parser("search", help="Search both UK and EU")
     search_parser.add_argument("query", help="Search terms")
@@ -1012,7 +1512,7 @@ def main():
     conn = _init_cache()
     output_json = args.json
 
-    if args.command in ("uk", "eu"):
+    if args.command in ("uk", "eu", "euleg"):
         source = args.command
         bib = lookup_and_format(source, args.query, args.key)
         if bib:
@@ -1047,6 +1547,7 @@ def main():
     elif args.command == "search":
         uk_results = uk_search(args.query, per_page=args.limit)
         eu_results = eu_search(args.query, limit=args.limit)
+        euleg_results = eu_legislation_search(args.query, limit=args.limit)
 
         if output_json:
             print(json.dumps({
@@ -1057,8 +1558,14 @@ def main():
                          "case_number": r.get("case_number", ""),
                          "is_ag_opinion": r.get("is_ag_opinion", False)}
                         for r in eu_results],
+                "euleg": [{"celex": r["celex"], "title": r["title"], "date": r["date"],
+                           "instrument_type": r.get("instrument_type", ""),
+                           "in_force": r.get("in_force")}
+                          for r in euleg_results],
             }))
         else:
+            if not uk_results and not eu_results and not euleg_results:
+                print("No results found.", file=sys.stderr)
             if uk_results:
                 print("=== UK Cases ===")
                 for r in uk_results:
@@ -1069,8 +1576,11 @@ def main():
                 for r in eu_results:
                     num = r.get("case_number", r.get("celex", ""))
                     print(f"  {num:20s}  {r['title'][:60]:60s}  {r['date']}")
-            if not uk_results and not eu_results:
-                print("No results found.", file=sys.stderr)
+            if euleg_results:
+                print("\n=== EU Legislation ===")
+                for r in euleg_results:
+                    itype = r.get("instrument_type", "")
+                    print(f"  {r['celex']:16s}  {itype:12s}  {r['title'][:50]:50s}  {r['date']}")
 
     elif args.command == "cache":
         if args.cache_command == "list":

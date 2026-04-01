@@ -56,6 +56,23 @@ AG Opinions:
 	title = {College van burgemeester en wethouders van Rotterdam v M.E.E. Rijkeboer}}
 ```
 
+EU legislation (directives, regulations, decisions, treaties):
+```bibtex
+@legislation{200260EC,
+	title = {Council Directive 2002/60/{EC} of 27 June 2002 laying down specific provisions for the control of African swine fever},
+	date = {2002},
+	type = {directive},
+	entrysubtype = {directive},
+	number = {2002/60/EC},
+	journaltitle = {OJ},
+	series = {L},
+	volume = {192},
+	pages = {27},
+	keywords = {eu},
+	pagination = {article},
+}
+```
+
 ## Installation
 
 ### Prerequisites

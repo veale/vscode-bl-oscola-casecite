@@ -103,6 +103,7 @@ async function quickLookup(context, source) {
   const placeholders = {
     uk: "Neutral citation or party name, e.g. [2024] UKSC 30",
     eu: "Case number, CELEX, or ECLI, e.g. C-553/07",
+    euleg: "CELEX (e.g. 32016R0679) or keyword (e.g. data protection)",
   };
   const input = await vscode.window.showInputBox({
     prompt: `Look up ${source.toUpperCase()} case`,
@@ -213,6 +214,7 @@ function activate(context) {
     vscode.commands.registerCommand("casecite.focusSearch", () => sidebarProvider.focusSearch()),
     vscode.commands.registerCommand("casecite.lookupUK", () => quickLookup(context, "uk")),
     vscode.commands.registerCommand("casecite.lookupEU", () => quickLookup(context, "eu")),
+    vscode.commands.registerCommand("casecite.lookupEULeg", () => quickLookup(context, "euleg")),
     vscode.commands.registerCommand("casecite.cacheExport", () => cacheExport(context)),
     vscode.commands.registerCommand("casecite.cacheClear", () => cacheClear(context)),
   );
