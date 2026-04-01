@@ -2,6 +2,8 @@
 
 A VS Code extension (with a standalone Python script) that searches legal databases and produces `@jurisdiction` and `@legislation` biblatex entries compatible with OSCOLA / [biblatex-oscola](https://github.com/PaulStanley/oscola-biblatex).
 
+Install it [here](https://marketplace.visualstudio.com/items?itemName=mveale.casecite).
+
 <img width="250" alt="Image of UK legislation query" src="https://github.com/user-attachments/assets/6ce89bf9-aeb6-4780-a5cc-3d3b8d3bd447" />
 <img width="250" alt="Image of EU case query" src="https://github.com/user-attachments/assets/52dfa0a6-f2db-4bcd-9d0f-c27a075027c3" />
 <img width="250"  alt="Image of EU legislation query" src="https://github.com/user-attachments/assets/32b7b14b-e425-4d92-99cf-c5cbce95a289" />
@@ -174,6 +176,10 @@ A VS Code extension (with a standalone Python script) that searches legal databa
 - **Optional**: `pip install echr-extractor` for ECHR support (you'll be prompted if needed)
 
 ### As a VS Code extension
+
+Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=mveale.casecite)
+
+But if you want to use it from here:
 
 1. Clone or download this folder.
 2. Open it in VS Code.
