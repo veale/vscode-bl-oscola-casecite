@@ -1,6 +1,6 @@
 # CaseCite — UK, EU & ECHR Law → BibLaTeX
 
-A VS Code extension (with a standalone Python script) that searches legal databases and produces `@jurisdiction` and `@legislation` biblatex entries compatible with OSCOLA / biblatex-oscola.
+A VS Code extension (with a standalone Python script) that searches legal databases and produces `@jurisdiction` and `@legislation` biblatex entries compatible with OSCOLA / [biblatex-oscola](https://github.com/PaulStanley/oscola-biblatex).
 
 ## Sources
 
