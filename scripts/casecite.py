@@ -1784,7 +1784,8 @@ def uk_legislation_to_biblatex(leg: dict, cite_key: str = "") -> str:
 # if not installed, ECHR functions return empty results with a warning.
 
 ECHR_FIELDS = [
-    "docname", "appno", "judgementdate", "doctype", "doctypebranch",
+    "docname", "appno", "judgementdate", "decisiondate", "kpdate",
+    "doctype", "doctypebranch",
     "publishedby", "externalsources", "scl",
 ]
 
@@ -1977,7 +1978,16 @@ def echr_search(query: str, limit: int = 10) -> list:
 
             title = _clean_echr_title(docname_raw)
             appno = _clean_appno(str(row.get("appno", "")))
-            date = _normalise_echr_date(str(row.get("judgementdate", "")))
+
+            # Try multiple date fields
+            date = ""
+            for date_col in ("judgementdate", "decisiondate", "kpdate"):
+                raw = str(row.get(date_col, ""))
+                if raw and raw != "nan" and raw.strip():
+                    date = _normalise_echr_date(raw)
+                    if date:
+                        break
+
             institution = _detect_echr_institution(row.to_dict())
 
             # Deduplicate by appno
@@ -2044,7 +2054,16 @@ def echr_lookup(query: str) -> Optional[dict]:
 
         title = _clean_echr_title(str(best_row.get("docname", "")))
         appno = _clean_appno(str(best_row.get("appno", "")))
-        date_full = _normalise_echr_date(str(best_row.get("judgementdate", "")))
+
+        # Try multiple date fields — HUDOC uses different fields for different doc types
+        date_full = ""
+        for date_col in ("judgementdate", "decisiondate", "kpdate", "dateofdelivery"):
+            raw = str(best_row.get(date_col, ""))
+            if raw and raw != "nan" and raw.strip():
+                date_full = _normalise_echr_date(raw)
+                if date_full:
+                    break
+
         institution = _detect_echr_institution(best_row)
         reporter = _parse_echr_reporter(best_row)
 
@@ -2095,13 +2114,15 @@ def echr_to_biblatex(case: dict, cite_key: str = "") -> str:
         lines.append(f"\treporter = {{Series A}},")
         if reporter.get("pages"):
             lines.append(f"\tpages = {{{reporter['pages']}}},")
-        lines.append(f"\tdate = {{{date[:4]}}},")
+        if date:
+            lines.append(f"\tdate = {{{date[:4]}}},")
 
     elif reporter and reporter.get("reporter") == "ECHR":
         # Template B: ECHR Reports reported
         lines.append(f"\treporter = {{ECHR}},")
-        year = reporter.get("date_year", date[:4])
-        lines.append(f"\tdate = {{{year}}},")
+        year = reporter.get("date_year", date[:4] if date else "")
+        if year:
+            lines.append(f"\tdate = {{{year}}},")
         if reporter.get("volume"):
             lines.append(f"\tvolume = {{{reporter['volume']}}},")
         if reporter.get("pages"):
@@ -2109,7 +2130,8 @@ def echr_to_biblatex(case: dict, cite_key: str = "") -> str:
 
     elif reporter and reporter.get("journaltitle") == "DR":
         # Template D: Commission with DR reporter
-        lines.append(f"\tdate = {{{date[:4]}}},")
+        if date:
+            lines.append(f"\tdate = {{{date[:4]}}},")
         if reporter.get("volume"):
             lines.append(f"\tvolume = {{{reporter['volume']}}},")
         lines.append(f"\tjournaltitle = {{DR}},")
@@ -2120,7 +2142,8 @@ def echr_to_biblatex(case: dict, cite_key: str = "") -> str:
         # Template C (or D unreported): no official reporter
         if appno:
             lines.append(f"\tnumber = {{{appno}}},")
-        lines.append(f"\tdate = {{{date}}},")
+        if date:
+            lines.append(f"\tdate = {{{date}}},")
 
     lines.append(f"\tinstitution = {{{institution}}},")
     lines.append(f"\tkeywords = {{echr}},")
