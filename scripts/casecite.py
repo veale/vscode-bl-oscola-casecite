@@ -588,7 +588,7 @@ CDM = "http://publications.europa.eu/ontology/cdm#"
 CASE_INFO_QUERY = """
 PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 
-SELECT ?ecli ?date ?court_code ?caseNumber ?parties ?resource_type ?advocate_general
+SELECT ?ecli ?date ?court_code ?caseNumber ?parties ?advocate_general
 WHERE {{
   ?work cdm:resource_legal_id_celex ?celex .
   FILTER(STR(?celex) = "{celex}")
@@ -596,9 +596,6 @@ WHERE {{
   OPTIONAL {{ ?work cdm:work_date_document ?date . }}
   OPTIONAL {{ ?work cdm:case-law_delivered_by_court_formation ?courtUri .
               BIND(REPLACE(STR(?courtUri), "^.*/", "") AS ?court_code) }}
-  OPTIONAL {{ ?work cdm:resource_legal_id_celex ?work_celex .
-              ?work cdm:work_has_resource-type ?rtUri .
-              BIND(REPLACE(STR(?rtUri), "^.*/", "") AS ?resource_type) }}
   OPTIONAL {{ ?work cdm:case-law_delivered_by_advocate-general ?agUri .
               ?agUri cdm:agent_name ?advocate_general }}
   OPTIONAL {{
@@ -635,26 +632,33 @@ LIMIT {limit}
 
 
 def _sparql_query(query: str) -> list:
-    """Execute a SPARQL query against the CELLAR endpoint."""
-    headers = {"Accept": "application/sparql-results+json"}
-    try:
-        # Use POST with form-encoded query (like the MCP server does)
-        encoded = urllib.parse.urlencode({"query": query}).encode("utf-8")
-        req = urllib.request.Request(
-            CELLAR_SPARQL_ENDPOINT,
-            data=encoded,
-            headers={
-                "Accept": "application/sparql-results+json",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        bindings = data.get("results", {}).get("bindings", [])
-        return bindings
-    except Exception as e:
-        print(f"CELLAR SPARQL error: {e}", file=sys.stderr)
-        return []
+    """Execute a SPARQL query against the CELLAR endpoint with retry."""
+    import time
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            encoded = urllib.parse.urlencode({"query": query}).encode("utf-8")
+            req = urllib.request.Request(
+                CELLAR_SPARQL_ENDPOINT,
+                data=encoded,
+                headers={
+                    "Accept": "application/sparql-results+json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data.get("results", {}).get("bindings", [])
+        except (urllib.error.URLError, OSError) as e:
+            # Retry on DNS/network errors (transient)
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            print(f"CELLAR SPARQL error after {max_retries + 1} attempts: {e}", file=sys.stderr)
+            return []
+        except Exception as e:
+            print(f"CELLAR SPARQL error: {e}", file=sys.stderr)
+            return []
 
 
 def _celex_from_case_number(case_num: str) -> Optional[str]:
@@ -729,22 +733,30 @@ def _parse_eu_title(title_str: str) -> dict:
 
 
 def eu_lookup_by_celex(celex: str) -> Optional[dict]:
-    """Look up an EU case by its CELEX number."""
+    """Look up an EU case by its CELEX number.
+    
+    Tries CELLAR SPARQL first; falls back to Formex XML extraction
+    if SPARQL returns nothing (timeout, Virtuoso issues, etc.).
+    """
     results = _sparql_query(CASE_INFO_QUERY.format(celex=celex))
-    if not results:
-        return None
+    if results:
+        return _parse_sparql_case_result(celex, results[0])
 
-    r = results[0]
+    # Fallback: try extracting basic info from Formex XML
+    return _eu_lookup_formex_fallback(celex)
+
+
+def _parse_sparql_case_result(celex: str, r: dict) -> dict:
+    """Parse a SPARQL result row into a case dict."""
     ecli = r.get("ecli", {}).get("value", "")
     date = r.get("date", {}).get("value", "")
     court_code_raw = r.get("court_code", {}).get("value", "")
     title_raw = r.get("parties", {}).get("value", "")
     case_num_raw = r.get("caseNumber", {}).get("value", "")
-    resource_type = r.get("resource_type", {}).get("value", "")
     ag_name_raw = r.get("advocate_general", {}).get("value", "")
 
-    # Detect AG opinions: CELEX contains "CC" or resource_type is OPIN_AG
-    is_ag_opinion = ("CC" in celex) or (resource_type == "OPIN_AG")
+    # Detect AG opinions from CELEX suffix (CC = conclusions/opinions)
+    is_ag_opinion = "CC" in celex
 
     # Parse the court code — now comes pre-extracted from SPARQL REPLACE()
     institution = ""
@@ -791,6 +803,104 @@ def eu_lookup_by_celex(celex: str) -> Optional[dict]:
         "is_ag_opinion": is_ag_opinion,
         "ag_name": ag_name,
     }
+
+
+def _eu_lookup_formex_fallback(celex: str) -> Optional[dict]:
+    """
+    Fallback: extract basic case info from Formex XML when SPARQL fails.
+    This is slower (downloads the full Formex zip) but more reliable.
+    """
+    try:
+        url = f"https://publications.europa.eu/resource/celex/{celex}"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/zip;mtype=fmx4",
+            "Accept-Language": "eng",
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status != 200:
+                return None
+            data = resp.read()
+            zf = zipfile.ZipFile(io.BytesIO(data))
+            xml_text = None
+            for name in zf.namelist():
+                if name.endswith((".xml", ".fmx", ".fmx4")):
+                    xml_text = zf.read(name).decode("utf-8", errors="replace")
+                    break
+            if not xml_text:
+                return None
+
+        root = ET.fromstring(xml_text)
+
+        # Extract ECLI
+        ecli_el = root.find(".//NO.ECLI")
+        ecli = ecli_el.get("ECLI", "") if ecli_el is not None else ""
+        if ecli.startswith("ECLI:"):
+            ecli = ecli[5:]
+
+        # Extract case number
+        case_num_el = root.find(".//NO.CASE")
+        case_number = ""
+        if case_num_el is not None and case_num_el.text:
+            case_number = case_num_el.text.strip()
+            # Normalise unicode dashes to ASCII
+            case_number = case_number.replace("\u2011", "-").replace("\u2010", "-")
+
+        # Extract date
+        date = ""
+        # Look for the judgment date in TITLE/TI/P/DATE
+        for date_el in root.iter("DATE"):
+            iso = date_el.get("ISO", "")
+            if iso and len(iso) == 8:
+                date = f"{iso[:4]}-{iso[4:6]}-{iso[6:8]}"
+                break
+
+        # Extract parties from PARTIES element
+        parties = ""
+        parties_el = root.find(".//PARTIES")
+        if parties_el is not None:
+            plaintiff_el = parties_el.find(".//PLAINTIFS")
+            defendant_el = parties_el.find(".//DEFENDANTS")
+            if plaintiff_el is not None and defendant_el is not None:
+                p_text = "".join(plaintiff_el.itertext()).strip()
+                d_text = "".join(defendant_el.itertext()).strip()
+                if p_text and d_text:
+                    parties = f"{p_text} v {d_text}"
+
+        # Fallback: extract from PAGE.HEADER
+        if not parties:
+            header_el = root.find(".//PAGE.HEADER")
+            if header_el is not None:
+                for p in header_el.findall("P"):
+                    text = "".join(p.itertext()).strip()
+                    # The second P in PAGE.HEADER is typically the short name
+                    if text and not text.startswith("JUDGMENT") and not text.startswith("OPINION"):
+                        parties = text
+                        break
+
+        # Determine institution from CELEX
+        if "CJ" in celex or "CC" in celex:
+            institution = "CJEU"
+        elif "TJ" in celex:
+            institution = "General Court"
+        else:
+            institution = "CJEU"
+
+        is_ag = "CC" in celex
+
+        return {
+            "celex": celex,
+            "ecli": ecli,
+            "date": date,
+            "institution": institution,
+            "case_number": case_number,
+            "title": parties.strip().rstrip("."),
+            "source": "eu",
+            "is_ag_opinion": is_ag,
+            "ag_name": "",
+        }
+    except Exception as e:
+        print(f"Formex fallback error for {celex}: {e}", file=sys.stderr)
+        return None
 
 
 def eu_search(query: str, limit: int = 10) -> list:
@@ -1383,15 +1493,676 @@ def eu_legislation_to_biblatex(leg: dict, cite_key: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# UK Legislation (legislation.gov.uk API)
+# ---------------------------------------------------------------------------
+
+# Type → (OSCOLA keywords, entrysubtype, pagination, number_prefix)
+UK_LEG_TYPE_MAP = {
+    # Primary — Westminster
+    "ukpga": ("en", "primary", "section", ""),
+    "ukla":  ("en", "primary", "section", ""),
+    "ukppa": ("en", "primary", "section", ""),
+    "ukcm":  ("en", "primary", "section", ""),
+    # Primary — Scotland
+    "asp":   ("sc", "primary", "section", "asp"),
+    "aosp":  ("sc", "primary", "section", ""),
+    # Primary — Wales
+    "asc":   ("cy", "primary", "section", "asc"),
+    "anaw":  ("cy", "primary", "section", "anaw"),
+    "mwa":   ("cy", "primary", "section", "nawm"),
+    # Primary — Northern Ireland
+    "nia":   ("ni", "primary", "section", "c"),
+    "apni":  ("ni", "primary", "section", "c"),
+    "mnia":  ("ni", "primary", "section", ""),
+    # Secondary — UK
+    "uksi":  ("en", "secondary", "regulation", "SI"),
+    "uksro": ("en", "secondary", "rule", r"SR\&O"),
+    "ukci":  ("en", "secondary", "regulation", ""),
+    "ukmo":  ("en", "secondary", "regulation", ""),
+    # Secondary — Scotland
+    "ssi":   ("sc", "secondary", "regulation", "SSI"),
+    # Secondary — Wales
+    "wsi":   ("cy", "secondary", "regulation", "WSI"),
+    # Secondary — Northern Ireland
+    "nisr":  ("ni", "secondary", "regulation", "SR"),
+    "nisi":  ("ni", "secondary", "article", ""),
+    "nisro": ("ni", "secondary", "rule", ""),
+    # Draft
+    "ukdsi": ("gb", "secondary", "regulation", ""),
+    "sdsi":  ("sc", "secondary", "regulation", ""),
+    "nidsr": ("ni", "secondary", "regulation", ""),
+    "wdsi":  ("cy", "secondary", "regulation", ""),
+    # EU retained / assimilated law (on legislation.gov.uk = UK domestic law)
+    "eur":   ("eu, assimilated", "secondary", "article", ""),
+    "eudn":  ("eu, assimilated", "secondary", "article", ""),
+    "eudr":  ("eu, assimilated", "secondary", "article", ""),
+}
+
+UK_LEG_API = "https://www.legislation.gov.uk"
+
+
+def _uk_leg_title_strip_year(title: str) -> str:
+    """
+    Strip the trailing year from a legislation title for the bib entry.
+    OSCOLA expects just 'Unfair Contract Terms Act' not 'Unfair Contract Terms Act 1977'
+    — the year goes in the date field.
+
+    But only strip if the title ends with a 4-digit year.
+    SI titles starting with 'The' also lose the 'The'.
+    """
+    s = title.strip()
+    # Remove leading 'The ' for SIs
+    if s.startswith("The "):
+        s = s[4:]
+    # Remove trailing year (e.g. "Data Protection Act 2018" → "Data Protection Act")
+    m = re.match(r'^(.+?)\s+(\d{4})\s*$', s)
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return s, ""
+
+
+def _uk_leg_format_number(leg_type: str, year: int, number: int) -> str:
+    """
+    Format the legislation number for the bib entry.
+    Primary: 'asp 2' for Scottish Acts, 'asc 2' for Welsh, 'c 5' for NI, empty for ukpga
+    Secondary: 'SI 2004/3166', 'SSI 2020/123', etc.
+    """
+    info = UK_LEG_TYPE_MAP.get(leg_type, ("en", "primary", "section", ""))
+    prefix = info[3]
+    subtype = info[1]
+
+    if not prefix:
+        return ""
+
+    if subtype == "secondary":
+        # SI YYYY/NNNN format
+        return f"{prefix} {year}\\slash {number}"
+    else:
+        # Primary devolved: asp 2, asc 2, c 5
+        return f"{prefix} {number}"
+
+
+def uk_legislation_search(query: str, limit: int = 15) -> list:
+    """
+    Search UK legislation via legislation.gov.uk identifier search.
+    Uses the /id?title= endpoint which has a fast text index.
+    """
+    try:
+        encoded_title = urllib.parse.quote(query, safe="")
+        url = f"{UK_LEG_API}/id?title={encoded_title}"
+        req = urllib.request.Request(url, headers={"Accept": "application/xhtml+xml, text/html"})
+        # Don't follow redirects — we want the 300 Multiple Choices response
+        # or the 301 redirect to a single result
+        opener = urllib.request.build_opener(urllib.request.HTTPHandler)
+
+        try:
+            resp = opener.open(req, timeout=15)
+            # 200 = single result page, parse it
+            html = resp.read().decode("utf-8", errors="replace")
+            final_url = resp.url
+            return _parse_uk_leg_search_html(html, final_url, limit)
+        except urllib.error.HTTPError as e:
+            if e.code in (300, 301, 303):
+                # 300 Multiple Choices: parse the HTML list
+                # 301/303: single result redirect
+                if e.code in (301, 303):
+                    location = e.headers.get("Location", "")
+                    if location:
+                        return _uk_leg_result_from_redirect(location)
+                # Read the 300 response body
+                html = e.read().decode("utf-8", errors="replace")
+                return _parse_uk_leg_search_html(html, url, limit)
+            raise
+    except Exception as e:
+        print(f"UK legislation search error: {e}", file=sys.stderr)
+        return []
+
+
+def _parse_uk_leg_search_html(html: str, base_url: str, limit: int) -> list:
+    """Parse the HTML response from legislation.gov.uk identifier search."""
+    results = []
+    # Extract links from <li><a href="...">Title</a></li>
+    for m in re.finditer(r'<a\s+href="(/id/[^"]+)"[^>]*>([^<]+)</a>', html):
+        if len(results) >= limit:
+            break
+        path = m.group(1)  # e.g. /id/ukpga/1977/50
+        title = m.group(2).strip()
+        # Parse type/year/number from path
+        parsed = _parse_uk_leg_path(path)
+        if parsed:
+            results.append({
+                "title": title,
+                "leg_type": parsed["type"],
+                "year": parsed["year"],
+                "number": parsed["number"],
+                "source": "ukleg",
+            })
+    return results
+
+
+def _uk_leg_result_from_redirect(location: str) -> list:
+    """Create a single result from a redirect URL."""
+    parsed = _parse_uk_leg_path(location)
+    if not parsed:
+        return []
+    # We need to fetch the title from metadata
+    try:
+        meta_url = f"{UK_LEG_API}/{parsed['type']}/{parsed['year']}/{parsed['number']}/data.xml"
+        xml_text = _fetch_text(meta_url, headers={"Accept": "application/xml"})
+        root = ET.fromstring(xml_text)
+        # Title is in <dc:title> or <ukm:Title>
+        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+        title_el = root.find(".//dc:title", ns)
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+        if not title:
+            title = f"{parsed['type'].upper()} {parsed['year']}/{parsed['number']}"
+    except Exception:
+        title = f"{parsed['type'].upper()} {parsed['year']}/{parsed['number']}"
+
+    return [{
+        "title": title,
+        "leg_type": parsed["type"],
+        "year": parsed["year"],
+        "number": parsed["number"],
+        "source": "ukleg",
+    }]
+
+
+def _parse_uk_leg_path(path: str) -> Optional[dict]:
+    """Parse a legislation.gov.uk path like /id/ukpga/1977/50 into components."""
+    # Strip /id/ prefix if present
+    path = re.sub(r'^https?://[^/]+', '', path)
+    path = path.rstrip("/")
+    if path.startswith("/id/"):
+        path = path[4:]
+    elif path.startswith("/"):
+        path = path[1:]
+
+    parts = path.split("/")
+    if len(parts) < 3:
+        return None
+
+    leg_type = parts[0]
+    year_str = parts[1]
+    number_str = parts[2]
+
+    try:
+        year = int(year_str)
+        number = int(number_str)
+    except ValueError:
+        return None
+
+    return {"type": leg_type, "year": year, "number": number}
+
+
+def uk_legislation_lookup(leg_type: str, year: int, number: int) -> Optional[dict]:
+    """
+    Look up UK legislation by type/year/number via legislation.gov.uk metadata API.
+    """
+    try:
+        # Fetch metadata JSON
+        url = f"{UK_LEG_API}/{leg_type}/{year}/{number}/data.xml"
+        xml_text = _fetch_text(url, headers={"Accept": "application/xml"})
+        root = ET.fromstring(xml_text)
+
+        ns = {
+            "dc": "http://purl.org/dc/elements/1.1/",
+            "ukm": "http://www.legislation.gov.uk/namespaces/metadata",
+            "atom": "http://www.w3.org/2005/Atom",
+        }
+
+        # Title
+        title_el = root.find(".//dc:title", ns)
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+
+        return {
+            "title": title,
+            "leg_type": leg_type,
+            "year": year,
+            "number": number,
+            "source": "ukleg",
+        }
+    except Exception as e:
+        print(f"UK legislation lookup error: {e}", file=sys.stderr)
+        return None
+
+
+def uk_legislation_to_biblatex(leg: dict, cite_key: str = "") -> str:
+    """
+    Convert UK legislation dict to @legislation biblatex entry.
+
+    Follows OSCOLA / biblatex-oscola format:
+    - Primary: title (without year), date, entrysubtype=primary, pagination=section
+    - Secondary: title (without year), date, SI number, entrysubtype=secondary, pagination=regulation
+    - Devolved: keywords=sc/cy/ni, number=asp N / asc N / c N
+    """
+    title = leg.get("title", "")
+    leg_type = leg.get("leg_type", "ukpga")
+    year = leg.get("year", 0)
+    number = leg.get("number", 0)
+
+    type_info = UK_LEG_TYPE_MAP.get(leg_type, ("en", "primary", "section", ""))
+    keywords, subtype, pagination, _ = type_info
+
+    # Strip year from title and extract it
+    title_clean, title_year = _uk_leg_title_strip_year(title)
+    date_year = title_year or str(year)
+
+    if not cite_key:
+        # Generate key from title words + year
+        words = re.findall(r'[A-Za-z]+', title_clean)
+        key_parts = [w.lower() for w in words[:3] if w.lower() not in ("the", "of", "and", "for", "in")]
+        cite_key = "".join(key_parts) + str(year)[-2:] if key_parts else f"leg{year}"
+
+    safe_title = _escape_bibtex(title_clean)
+
+    # Format number
+    num_str = _uk_leg_format_number(leg_type, year, number)
+
+    lines = [
+        f"@legislation{{{cite_key},",
+        f"\ttitle = {{{safe_title}}},",
+        f"\tdate = {{{date_year}}},",
+        f"\tentrysubtype = {{{subtype}}},",
+        f"\tpagination = {{{pagination}}},",
+        f"\tkeywords = {{{keywords}}},",
+    ]
+
+    if num_str:
+        lines.append(f"\tnumber = {{{num_str}}},")
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# ECHR Case Law (via echr_extractor / HUDOC)
+# ---------------------------------------------------------------------------
+
+# The echr_extractor package handles HUDOC API queries. We wrap it to
+# produce OSCOLA-compliant @jurisdiction entries. The package is optional —
+# if not installed, ECHR functions return empty results with a warning.
+
+ECHR_FIELDS = [
+    "docname", "appno", "judgementdate", "doctype", "doctypebranch",
+    "publishedby", "externalsources", "scl",
+]
+
+def _ensure_echr_extractor():
+    """Check if echr_extractor is available. Returns get_echr or None with a message."""
+    try:
+        from echr_extractor import get_echr
+        return get_echr
+    except ImportError:
+        return None
+
+
+ECHR_MISSING_MSG = (
+    "ECHR search requires the echr-extractor package. "
+    "Install it with: pip install echr-extractor"
+)
+
+
+def _clean_echr_title(docname: str) -> str:
+    """
+    Clean HUDOC docname to standard 'Party A v Party B' format.
+    Strips 'CASE OF ', '(MERITS)', '(JUST SATISFACTION)', etc.
+    """
+    if not docname:
+        return ""
+    s = docname.strip()
+    # Remove "CASE OF " prefix
+    s = re.sub(r'^CASE\s+OF\s+', '', s, flags=re.IGNORECASE)
+    # Remove bracketed suffixes like (MERITS), (PRELIMINARY OBJECTIONS), etc.
+    s = re.sub(r'\s*\([^)]*(?:MERIT|OBJECTION|SATISFACTION|STRIKING|REVISION|INTERPRETATION|ARTICLE\s+50)[^)]*\)', '', s, flags=re.IGNORECASE)
+    # Normalise "v." to "v"
+    s = re.sub(r'\bv\.\s', 'v ', s)
+    # Title case (HUDOC often uses ALL CAPS)
+    # Check if most alpha chars are uppercase (allowing for 'v' connector)
+    alpha_chars = [c for c in s if c.isalpha() and c.lower() != 'v']
+    is_mostly_upper = alpha_chars and sum(1 for c in alpha_chars if c.isupper()) > len(alpha_chars) * 0.7
+    if is_mostly_upper:
+        # Convert to title case, preserving 'v' as lowercase
+        words = s.split()
+        result = []
+        for i, w in enumerate(words):
+            if w.lower() == 'v' or w.lower() == 'v.':
+                result.append('v')
+            elif w.lower() in ('the', 'of', 'and', 'for') and i > 0:
+                result.append(w.lower())
+            else:
+                result.append(w.capitalize())
+        s = ' '.join(result)
+    return s.strip()
+
+
+def _detect_echr_institution(row: dict) -> str:
+    """Determine if ECtHR or Commission from HUDOC data."""
+    doctype = str(row.get("doctype", "")).upper()
+    branch = str(row.get("doctypebranch", "")).upper()
+    # Commission doctypes
+    if doctype in ("HEDEC", "HFDEC", "COMOLD", "COMDEC"):
+        return "Commission"
+    if "COMMISSION" in branch:
+        return "Commission"
+    return "ECtHR"
+
+
+def _parse_echr_reporter(row: dict) -> Optional[dict]:
+    """
+    Parse official reporter citation from HUDOC metadata.
+    Returns dict with reporter, volume, pages — or None if unreported.
+    """
+    # Check multiple columns for reporter strings
+    texts = []
+    for col in ("publishedby", "externalsources", "scl"):
+        val = row.get(col, "")
+        if val and str(val) != "nan":
+            texts.append(str(val))
+    combined = " | ".join(texts)
+
+    if not combined:
+        return None
+
+    # Series A: "Series A no. 122" or "Series A, no. 122"
+    m = re.search(r'Series\s+A[,]?\s*no\.?\s*(\d+)', combined, re.IGNORECASE)
+    if m:
+        return {"reporter": "Series A", "pages": m.group(1), "volume": ""}
+
+    # ECHR Reports: "Reports of Judgments and Decisions YYYY-VOL" or "ECHR YYYY-VOL"
+    # e.g. "Reports of Judgments and Decisions 1998-VIII" or "ECHR 2003-XI, p. 3124"
+    m = re.search(
+        r'(?:Reports?\s+(?:of\s+)?Judgments?\s+and\s+Decisions?\s+|ECHR\s+)'
+        r'(\d{4})[- ]*([IVXLC]+)',
+        combined, re.IGNORECASE,
+    )
+    if m:
+        year_str = m.group(1)
+        volume_roman = m.group(2)
+        # Try to find page number
+        page = ""
+        page_match = re.search(r'(?:p\.\s*|,\s*)(\d+)', combined[m.end():])
+        if page_match:
+            page = page_match.group(1)
+        # Convert roman numeral volume to integer
+        roman_map = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100}
+        vol_int = 0
+        for i, ch in enumerate(volume_roman):
+            val = roman_map.get(ch, 0)
+            if i + 1 < len(volume_roman) and val < roman_map.get(volume_roman[i + 1], 0):
+                vol_int -= val
+            else:
+                vol_int += val
+        return {"reporter": "ECHR", "date_year": year_str,
+                "volume": str(vol_int), "pages": page}
+
+    # Commission: Decisions and Reports — "D.R. 64, p. 188" or "DR 64 p. 188"
+    m = re.search(r'D\.?R\.?\s*(\d+)[\s,]*(?:p\.?\s*)?(\d+)?', combined, re.IGNORECASE)
+    if m:
+        return {"reporter": "DR", "volume": m.group(1),
+                "pages": m.group(2) or "", "journaltitle": "DR"}
+
+    return None
+
+
+def _clean_appno(appno: str) -> str:
+    """Clean application number: take first if multiple, strip whitespace."""
+    if not appno:
+        return ""
+    # Split on semicolons (multiple app numbers)
+    parts = [p.strip() for p in str(appno).split(";") if p.strip()]
+    return parts[0] if parts else ""
+
+
+def _normalise_echr_date(date_str: str) -> str:
+    """
+    Normalise HUDOC date to YYYY-MM-DD format.
+    Handles:
+      - '2006-04-25T00:00:00.000Z' → '2006-04-25'
+      - '25/04/2006' → '2006-04-25'
+      - '2006-04-25' → '2006-04-25'
+    """
+    if not date_str or date_str == "nan":
+        return ""
+    s = date_str.strip()
+    # ISO format with time: 2006-04-25T00:00:00.000Z
+    if "T" in s:
+        return s[:10]
+    # Already YYYY-MM-DD
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+        return s
+    # DD/MM/YYYY
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', s)
+    if m:
+        return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+    # Just return first 10 chars as fallback
+    return s[:10]
+
+
+def echr_search(query: str, limit: int = 10) -> list:
+    """
+    Search ECHR cases via echr_extractor.
+    Returns list of result dicts for the sidebar.
+    """
+    get_echr = _ensure_echr_extractor()
+    if get_echr is None:
+        print(ECHR_MISSING_MSG, file=sys.stderr)
+        return []
+
+    try:
+        kwargs = {
+            "fields": ECHR_FIELDS,
+            "save_file": "n",
+            "language": ["ENG"],  # English only — excludes translations
+        }
+        # Try as application number first (e.g. 47940/99)
+        if re.match(r'^\d+/\d{2}$', query.strip()):
+            kwargs["query_payload"] = f'appno:"{query.strip()}"'
+        else:
+            kwargs["query_payload"] = f'docname:"{query.strip()}"'
+
+        df = get_echr(**kwargs)
+
+        if df is False or df is None or (hasattr(df, 'empty') and df.empty):
+            return []
+
+        results = []
+        seen_appnos = set()
+        for _, row in df.head(limit * 3).iterrows():
+            docname_raw = str(row.get("docname", ""))
+
+            # Skip summary translations that sneak through
+            if "[" in docname_raw and "translation]" in docname_raw.lower():
+                continue
+
+            title = _clean_echr_title(docname_raw)
+            appno = _clean_appno(str(row.get("appno", "")))
+            date = _normalise_echr_date(str(row.get("judgementdate", "")))
+            institution = _detect_echr_institution(row.to_dict())
+
+            # Deduplicate by appno
+            if appno and appno in seen_appnos:
+                continue
+            if appno:
+                seen_appnos.add(appno)
+
+            results.append({
+                "title": title,
+                "appno": appno,
+                "date": date,
+                "institution": institution,
+                "docname": docname_raw,  # raw docname for precise lookup
+                "source": "echr",
+            })
+            if len(results) >= limit:
+                break
+        return results
+    except Exception as e:
+        print(f"ECHR search error: {e}", file=sys.stderr)
+        return []
+
+
+def echr_lookup(query: str) -> Optional[dict]:
+    """
+    Look up a specific ECHR case.
+    Accepts raw docname (from sidebar click), case name, or application number.
+    Returns a dict with all fields needed for biblatex formatting.
+    """
+    get_echr = _ensure_echr_extractor()
+    if get_echr is None:
+        print(ECHR_MISSING_MSG, file=sys.stderr)
+        return None
+
+    try:
+        kwargs = {
+            "fields": ECHR_FIELDS,
+            "save_file": "n",
+            "language": ["ENG"],
+        }
+        # Try application number
+        if re.match(r'^\d+/\d{2}$', query.strip()):
+            kwargs["query_payload"] = f'appno:"{query.strip()}"'
+        else:
+            # Use docname for precise lookup
+            kwargs["query_payload"] = f'docname:"{query.strip()}"'
+
+        df = get_echr(**kwargs)
+
+        if df is False or df is None or (hasattr(df, 'empty') and df.empty):
+            return None
+
+        # Try exact docname match first (for sidebar click-through)
+        best_row = None
+        if "docname" in df.columns:
+            for _, row in df.iterrows():
+                if str(row.get("docname", "")).strip() == query.strip():
+                    best_row = row.to_dict()
+                    break
+        # Fall back to first result
+        if best_row is None:
+            best_row = df.iloc[0].to_dict()
+
+        title = _clean_echr_title(str(best_row.get("docname", "")))
+        appno = _clean_appno(str(best_row.get("appno", "")))
+        date_full = _normalise_echr_date(str(best_row.get("judgementdate", "")))
+        institution = _detect_echr_institution(best_row)
+        reporter = _parse_echr_reporter(best_row)
+
+        return {
+            "title": title,
+            "appno": appno,
+            "date": date_full,
+            "institution": institution,
+            "reporter": reporter,
+            "source": "echr",
+        }
+    except Exception as e:
+        print(f"ECHR lookup error: {e}", file=sys.stderr)
+        return None
+
+
+def echr_to_biblatex(case: dict, cite_key: str = "") -> str:
+    """
+    Convert ECHR case dict to @jurisdiction biblatex entry.
+
+    Routes to one of four OSCOLA templates:
+    A) Reported - Series A (reporter + pages)
+    B) Reported - ECHR (reporter + volume + pages)
+    C) Unreported ECtHR (number + full date)
+    D) Commission (institution = Commission, may have DR reporter)
+    """
+    title = case.get("title", "")
+    date = case.get("date", "")
+    institution = case.get("institution", "ECtHR")
+    appno = case.get("appno", "")
+    reporter = case.get("reporter")  # None or dict
+
+    if not cite_key:
+        # Generate key from first party + 2-digit year
+        first_party = re.split(r'\s+v\s+', title, maxsplit=1)[0] if title else "case"
+        first_word = re.findall(r'[A-Za-z]+', first_party)
+        key_name = first_word[0].lower() if first_word else "case"
+        year_short = date[2:4] if len(date) >= 4 else "00"
+        cite_key = key_name + year_short
+
+    safe_title = _escape_bibtex(title)
+
+    lines = [f"@jurisdiction{{{cite_key},"]
+    lines.append(f"\ttitle = {{{safe_title}}},")
+
+    if reporter and reporter.get("reporter") == "Series A":
+        # Template A: Series A reported
+        lines.append(f"\treporter = {{Series A}},")
+        if reporter.get("pages"):
+            lines.append(f"\tpages = {{{reporter['pages']}}},")
+        lines.append(f"\tdate = {{{date[:4]}}},")
+
+    elif reporter and reporter.get("reporter") == "ECHR":
+        # Template B: ECHR Reports reported
+        lines.append(f"\treporter = {{ECHR}},")
+        year = reporter.get("date_year", date[:4])
+        lines.append(f"\tdate = {{{year}}},")
+        if reporter.get("volume"):
+            lines.append(f"\tvolume = {{{reporter['volume']}}},")
+        if reporter.get("pages"):
+            lines.append(f"\tpages = {{{reporter['pages']}}},")
+
+    elif reporter and reporter.get("journaltitle") == "DR":
+        # Template D: Commission with DR reporter
+        lines.append(f"\tdate = {{{date[:4]}}},")
+        if reporter.get("volume"):
+            lines.append(f"\tvolume = {{{reporter['volume']}}},")
+        lines.append(f"\tjournaltitle = {{DR}},")
+        if reporter.get("pages"):
+            lines.append(f"\tpages = {{{reporter['pages']}}},")
+
+    else:
+        # Template C (or D unreported): no official reporter
+        if appno:
+            lines.append(f"\tnumber = {{{appno}}},")
+        lines.append(f"\tdate = {{{date}}},")
+
+    lines.append(f"\tinstitution = {{{institution}}},")
+    lines.append(f"\tkeywords = {{echr}},")
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Unified interface
 # ---------------------------------------------------------------------------
 
 def lookup_and_format(source: str, query: str, cite_key: str = "") -> Optional[str]:
     """
     Look up a case and return a formatted biblatex entry.
-    source: 'uk', 'eu', 'euleg', or 'auto'
+    source: 'uk', 'eu', 'euleg', 'echr', or 'auto'
     """
     case = None
+
+    # ECHR lookup
+    if source == "echr":
+        echr_case = echr_lookup(query)
+        if echr_case:
+            return echr_to_biblatex(echr_case, cite_key)
+        return None
+
+    # UK legislation lookup
+    if source == "ukleg":
+        # Try parsing as type/year/number (e.g. "ukpga/2018/12")
+        parsed = _parse_uk_leg_path(query)
+        if parsed:
+            leg = uk_legislation_lookup(parsed["type"], parsed["year"], parsed["number"])
+            if leg:
+                return uk_legislation_to_biblatex(leg, cite_key)
+        # Otherwise search and return first result
+        results = uk_legislation_search(query, limit=5)
+        if results:
+            r = results[0]
+            leg = uk_legislation_lookup(r["leg_type"], r["year"], r["number"])
+            if leg:
+                return uk_legislation_to_biblatex(leg, cite_key)
+        return None
 
     # EU legislation lookup
     if source == "euleg":
@@ -1488,10 +2259,21 @@ def main():
     euleg_parser = subparsers.add_parser("euleg", help="Look up EU legislation")
     euleg_parser.add_argument("query", help="CELEX number or search terms")
 
+    # echr subcommand
+    echr_parser = subparsers.add_parser("echr", help="Look up ECHR case")
+    echr_parser.add_argument("query", help="Case name or application number")
+
+    # ukleg subcommand
+    ukleg_parser = subparsers.add_parser("ukleg", help="Look up UK legislation")
+    ukleg_parser.add_argument("query", help="Title or type/year/number (e.g. ukpga/2018/12)")
+
     # search subcommand
-    search_parser = subparsers.add_parser("search", help="Search both UK and EU")
+    search_parser = subparsers.add_parser("search", help="Search UK, EU, and ECHR")
     search_parser.add_argument("query", help="Search terms")
     search_parser.add_argument("--limit", "-l", type=int, default=10)
+    search_parser.add_argument("--source", "-s", default="all",
+                               choices=["all", "uk", "eu", "euleg", "echr", "ukleg"],
+                               help="Which source to search (default: all)")
 
     # cache subcommand
     cache_parser = subparsers.add_parser("cache", help="Manage the local cache")
@@ -1512,7 +2294,7 @@ def main():
     conn = _init_cache()
     output_json = args.json
 
-    if args.command in ("uk", "eu", "euleg"):
+    if args.command in ("uk", "eu", "euleg", "echr", "ukleg"):
         source = args.command
         bib = lookup_and_format(source, args.query, args.key)
         if bib:
@@ -1545,12 +2327,17 @@ def main():
             sys.exit(1)
 
     elif args.command == "search":
-        uk_results = uk_search(args.query, per_page=args.limit)
-        eu_results = eu_search(args.query, limit=args.limit)
-        euleg_results = eu_legislation_search(args.query, limit=args.limit)
+        src = args.source
+
+        uk_results = uk_search(args.query, per_page=args.limit) if src in ("all", "uk") else []
+        eu_results = eu_search(args.query, limit=args.limit) if src in ("all", "eu") else []
+        euleg_results = eu_legislation_search(args.query, limit=args.limit) if src in ("all", "euleg") else []
+        echr_results = echr_search(args.query, limit=args.limit) if src in ("all", "echr") else []
+        ukleg_results = uk_legislation_search(args.query, limit=args.limit) if src in ("all", "ukleg") else []
+        echr_available = _ensure_echr_extractor() is not None
 
         if output_json:
-            print(json.dumps({
+            result = {
                 "uk": [{"title": r["title"], "uri": r["uri"], "date": r["date"],
                          "citation": r.get("citation", ""), "url": r.get("url", "")}
                         for r in uk_results],
@@ -1562,9 +2349,19 @@ def main():
                            "instrument_type": r.get("instrument_type", ""),
                            "in_force": r.get("in_force")}
                           for r in euleg_results],
-            }))
+                "echr": [{"title": r["title"], "appno": r.get("appno", ""),
+                          "date": r["date"], "institution": r.get("institution", "ECtHR"),
+                          "docname": r.get("docname", "")}
+                         for r in echr_results],
+                "ukleg": [{"title": r["title"], "leg_type": r.get("leg_type", ""),
+                           "year": r.get("year", ""), "number": r.get("number", "")}
+                          for r in ukleg_results],
+            }
+            if not echr_available and src in ("all", "echr"):
+                result["echr_warning"] = ECHR_MISSING_MSG
+            print(json.dumps(result))
         else:
-            if not uk_results and not eu_results and not euleg_results:
+            if not uk_results and not eu_results and not euleg_results and not echr_results:
                 print("No results found.", file=sys.stderr)
             if uk_results:
                 print("=== UK Cases ===")
@@ -1581,6 +2378,10 @@ def main():
                 for r in euleg_results:
                     itype = r.get("instrument_type", "")
                     print(f"  {r['celex']:16s}  {itype:12s}  {r['title'][:50]:50s}  {r['date']}")
+            if echr_results:
+                print("\n=== ECHR Cases ===")
+                for r in echr_results:
+                    print(f"  {r.get('appno', ''):16s}  {r['title'][:60]:60s}  {r['date']}")
 
     elif args.command == "cache":
         if args.cache_command == "list":

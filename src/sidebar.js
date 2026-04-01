@@ -95,25 +95,16 @@ class CaseCiteSidebarProvider {
     this._postMessage({ type: "searchStart" });
 
     try {
-      const result = await this._runScript(["search", query.trim(), "--limit", "15"]);
-      // Enrich with source labels
+      // Only query the active source — avoids calling all 4 APIs
+      const result = await this._runScript(["search", query.trim(), "--limit", "15", "--source", filter]);
       const items = [];
-      if (filter !== "eu" && filter !== "euleg" && result.uk) {
-        for (const r of result.uk) {
-          items.push({ ...r, source: "uk" });
+      const sourceKey = filter;
+      if (result[sourceKey]) {
+        for (const r of result[sourceKey]) {
+          items.push({ ...r, source: sourceKey });
         }
       }
-      if (filter !== "uk" && filter !== "euleg" && result.eu) {
-        for (const r of result.eu) {
-          items.push({ ...r, source: "eu" });
-        }
-      }
-      if (filter !== "uk" && filter !== "eu" && result.euleg) {
-        for (const r of result.euleg) {
-          items.push({ ...r, source: "euleg" });
-        }
-      }
-      this._postMessage({ type: "searchResults", items, query });
+      this._postMessage({ type: "searchResults", items, query, echr_warning: result.echr_warning || "" });
     } catch (err) {
       this._postMessage({ type: "searchError", error: err.message });
     }
@@ -315,6 +306,10 @@ class CaseCiteSidebarProvider {
     background: var(--vscode-charts-orange, #e5a00d);
     color: var(--vscode-editor-background);
   }
+  .source-badge.echr {
+    background: var(--vscode-charts-red, #e05252);
+    color: var(--vscode-editor-background);
+  }
   .source-badge.type-tag {
     background: var(--vscode-badge-background);
     color: var(--vscode-badge-foreground);
@@ -489,13 +484,13 @@ class CaseCiteSidebarProvider {
 
 <div class="search-box">
   <input class="search-input" id="searchInput" type="text"
-         placeholder="Search UK &amp; EU cases &amp; legislation..." />
+         placeholder="Search cases &amp; legislation..." />
   <div class="filter-tabs">
-    <button class="filter-tab active" data-filter="all">All</button>
-    <button class="filter-tab" data-filter="uk">UK</button>
+    <button class="filter-tab active" data-filter="uk">UK</button>
+    <button class="filter-tab" data-filter="ukleg">UK Leg</button>
     <button class="filter-tab" data-filter="eu">EU Cases</button>
     <button class="filter-tab" data-filter="euleg">EU Leg</button>
-    <button class="filter-tab" data-filter="cache">Cache</button>
+    <button class="filter-tab" data-filter="echr">ECHR</button>
   </div>
 </div>
 
@@ -504,7 +499,7 @@ class CaseCiteSidebarProvider {
 
 <script>
 const vscode = acquireVsCodeApi();
-let currentFilter = "all";
+let currentFilter = "uk";
 let currentResults = [];
 let selectedIndex = -1;
 let currentBib = "";
@@ -538,13 +533,17 @@ document.querySelectorAll(".filter-tab").forEach(tab => {
 });
 
 // --- Results ---
-function renderResults(items, query) {
+function renderResults(items, query, echr_warning) {
   currentResults = items;
   selectedIndex = -1;
   const el = document.getElementById("results");
 
   if (!items || items.length === 0) {
-    el.innerHTML = '<div class="status">No results found</div>';
+    var msg = '<div class="status">No results found</div>';
+    if (echr_warning && currentFilter === "echr") {
+      msg = '<div class="status">' + escHtml(echr_warning) + '</div>';
+    }
+    el.innerHTML = msg;
     document.getElementById("detail").innerHTML = "";
     return;
   }
@@ -552,8 +551,12 @@ function renderResults(items, query) {
   el.innerHTML = items.map((r, i) => {
     let badge = r.source === "uk"
       ? '<span class="source-badge uk">UK</span>'
+      : r.source === "ukleg"
+      ? '<span class="source-badge uk">UK Leg</span>'
       : r.source === "euleg"
       ? '<span class="source-badge euleg">Leg</span>'
+      : r.source === "echr"
+      ? '<span class="source-badge echr">ECHR</span>'
       : '<span class="source-badge eu">EU</span>';
     if (r.is_ag_opinion) {
       badge += ' <span class="source-badge ag">AG</span>';
@@ -568,6 +571,10 @@ function renderResults(items, query) {
       meta = (r.celex || "") + " · " + (r.date || "");
       if (r.in_force === true) meta += " · in force";
       else if (r.in_force === false) meta += " · not in force";
+    } else if (r.source === "echr") {
+      meta = (r.appno || "") + " · " + (r.institution || "ECtHR") + " · " + (r.date || "");
+    } else if (r.source === "ukleg") {
+      meta = (r.leg_type || "").toUpperCase() + " · " + (r.year || "") + "/" + (r.number || "");
     } else {
       meta = (r.case_number || r.celex || "") + " · " + (r.date || "");
     }
@@ -622,6 +629,12 @@ function selectResult(idx) {
     }
   } else if (source === "euleg") {
     query = r.celex;
+  } else if (source === "echr") {
+    // Pass raw HUDOC docname for exact matching on lookup
+    query = r.docname || r.appno || r.title;
+  } else if (source === "ukleg") {
+    // Pass type/year/number path for direct lookup
+    query = r.leg_type + "/" + r.year + "/" + r.number;
   } else {
     query = r.celex || r.case_number;
   }
@@ -725,7 +738,7 @@ window.addEventListener("message", (event) => {
       document.getElementById("detail").innerHTML = "";
       break;
     case "searchResults":
-      renderResults(msg.items, msg.query);
+      renderResults(msg.items, msg.query, msg.echr_warning);
       break;
     case "searchError":
       document.getElementById("results").innerHTML =

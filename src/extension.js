@@ -104,6 +104,8 @@ async function quickLookup(context, source) {
     uk: "Neutral citation or party name, e.g. [2024] UKSC 30",
     eu: "Case number, CELEX, or ECLI, e.g. C-553/07",
     euleg: "CELEX (e.g. 32016R0679) or keyword (e.g. data protection)",
+    echr: "Case name or app no, e.g. Osman v UK or 47940/99",
+    ukleg: "Title, e.g. Data Protection Act or Unfair Contract Terms",
   };
   const input = await vscode.window.showInputBox({
     prompt: `Look up ${source.toUpperCase()} case`,
@@ -215,6 +217,8 @@ function activate(context) {
     vscode.commands.registerCommand("casecite.lookupUK", () => quickLookup(context, "uk")),
     vscode.commands.registerCommand("casecite.lookupEU", () => quickLookup(context, "eu")),
     vscode.commands.registerCommand("casecite.lookupEULeg", () => quickLookup(context, "euleg")),
+    vscode.commands.registerCommand("casecite.lookupECHR", () => quickLookup(context, "echr")),
+    vscode.commands.registerCommand("casecite.lookupUKLeg", () => quickLookup(context, "ukleg")),
     vscode.commands.registerCommand("casecite.cacheExport", () => cacheExport(context)),
     vscode.commands.registerCommand("casecite.cacheClear", () => cacheClear(context)),
   );
@@ -235,6 +239,14 @@ function activate(context) {
       vscode.window.showWarningMessage(
         `CaseCite: Python not found at '${getPythonPath()}'. Update casecite.pythonPath in settings.`
       );
+    } else {
+      // Check if echr-extractor is installed (optional dependency)
+      execFile(getPythonPath(), ["-c", "import echr_extractor"], (echrErr) => {
+        if (echrErr) {
+          // Don't block — just note it's available in the status bar the first time
+          // The user will see a clear error if they try to use ECHR features
+        }
+      });
     }
   });
 }
