@@ -4,6 +4,8 @@
   "description": "Search UK (National Archives), EU (CELLAR/EUR-Lex), and ECHR (HUDOC) case law and legislation, and insert @jurisdiction / @legislation biblatex entries with OSCOLA-compatible formatting.",
   "version": "0.1.0",
   "publisher": "mveale",
+  "repository": "https://github.com/veale/vscode-bl-oscola-casecite/",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.80.0"
   },
