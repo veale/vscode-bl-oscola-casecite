@@ -243,10 +243,6 @@ The neutral citation regex is permissive — new court abbreviations are parsed 
 | `CaseCite: Export cache` | | Save all cached entries as `.bib` |
 | `CaseCite: Clear cache` | | Delete all cached entries |
 
-## `\cite{}` autocomplete
-
-When editing `.tex` or `.bib` files, typing `\cite{` (or `\autocite{`, `\textcite{`, `\footcite{`, `\parencite{`) triggers completion from your local cache. No network call — instant suggestions from cases you've already looked up.
-
 ## CLI usage
 
 ```
