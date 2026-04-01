@@ -73,7 +73,7 @@ class CaseCiteSidebarProvider {
       execFile(
         this._getPythonPath(),
         [this._getScriptPath(), "--json", ...args],
-        { env, timeout: 30000 },
+        { env, timeout: 90000 },
         (err, stdout, stderr) => {
           if (err) return reject(new Error(stderr || err.message));
           try {
@@ -349,11 +349,15 @@ class CaseCiteSidebarProvider {
     display: flex;
     align-items: center;
     gap: 6px;
-    margin-bottom: 8px;
+    margin-bottom: 6px;
   }
   .key-label {
     font-size: 11px;
     color: var(--vscode-descriptionForeground);
+    min-width: 62px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
   }
   .key-input {
     flex: 1;
@@ -364,6 +368,39 @@ class CaseCiteSidebarProvider {
     border-radius: 3px;
     font-family: var(--vscode-editor-font-family);
     font-size: 12px;
+  }
+  .opt-fields { margin-bottom: 8px; }
+  .info-dot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    border: 1px solid var(--vscode-input-border);
+    font-size: 8px;
+    color: var(--vscode-descriptionForeground);
+    cursor: help;
+    position: relative;
+  }
+  .info-dot:hover .info-tip { display: block; }
+  .info-tip {
+    display: none;
+    position: absolute;
+    bottom: 120%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 200px;
+    padding: 6px 8px;
+    background: var(--vscode-editorHoverWidget-background, #252526);
+    color: var(--vscode-editorHoverWidget-foreground, #ccc);
+    border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
+    font-size: 11px;
+    line-height: 1.4;
+    border-radius: 3px;
+    z-index: 10;
+    pointer-events: none;
+    font-weight: normal;
+    text-transform: none;
   }
 
   /* Action buttons */
@@ -452,19 +489,8 @@ let currentBib = "";
 
 // --- Search ---
 const searchInput = document.getElementById("searchInput");
-let debounceTimer;
-searchInput.addEventListener("input", () => {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => {
-    const q = searchInput.value.trim();
-    if (q.length >= 2) {
-      vscode.postMessage({ type: "search", query: q, filter: currentFilter });
-    }
-  }, 400);
-});
 searchInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
-    clearTimeout(debounceTimer);
     const q = searchInput.value.trim();
     if (q) vscode.postMessage({ type: "search", query: q, filter: currentFilter });
   }
@@ -568,6 +594,7 @@ function renderDetail(result) {
     return;
   }
 
+  var originalBib = result.bib;
   currentBib = result.bib;
   const key = result.cite_key || "";
 
@@ -578,6 +605,16 @@ function renderDetail(result) {
     + '    <span class="key-label">Cite key:</span>'
     + '    <input class="key-input" id="keyInput" type="text" value="' + escAttr(key) + '" />'
     + '  </div>'
+    + '  <div class="opt-fields">'
+    + '    <div class="key-row">'
+    + '      <span class="key-label">shorthand <span class="info-dot" title="A shorter title introduced the first time cited, thereafter used in place of the full title. Listed in any table of abbreviations.">?</span></span>'
+    + '      <input class="key-input" id="shorthandInput" type="text" placeholder="optional" />'
+    + '    </div>'
+    + '    <div class="key-row">'
+    + '      <span class="key-label">shorttitle <span class="info-dot" title="Silently replaces the full title on second and subsequent citations. For household names.">?</span></span>'
+    + '      <input class="key-input" id="shorttitleInput" type="text" placeholder="optional" />'
+    + '    </div>'
+    + '  </div>'
     + '  <div class="actions">'
     + '    <button class="btn btn-primary" id="btnInsert">Insert at cursor</button>'
     + '    <button class="btn btn-secondary" id="btnAppend">Append to .bib</button>'
@@ -585,18 +622,45 @@ function renderDetail(result) {
     + '  </div>'
     + '</div>';
 
-  // Cite key editing — regenerate bib preview on change
-  document.getElementById("keyInput").addEventListener("input", (e) => {
-    const newKey = e.target.value.trim();
-    if (newKey && currentBib) {
-      const updatedBib = currentBib.replace(
-        /^@jurisdiction\{[^,]+,/,
-        "@jurisdiction{" + newKey + ","
-      );
-      currentBib = updatedBib;
-      document.getElementById("bibPreview").textContent = updatedBib;
+  function rebuildBib() {
+    var newKey = document.getElementById("keyInput").value.trim();
+    var sh = document.getElementById("shorthandInput").value.trim();
+    var st = document.getElementById("shorttitleInput").value.trim();
+    if (!newKey) return;
+    var NL = String.fromCharCode(10);
+    var TAB = String.fromCharCode(9);
+    // Split original bib into lines, replace key, add optional fields
+    var lines = originalBib.split(NL);
+    // Replace cite key in first line
+    var firstLine = lines[0];
+    var braceIdx = firstLine.indexOf("{");
+    var commaIdx = firstLine.indexOf(",", braceIdx);
+    if (braceIdx >= 0 && commaIdx >= 0) {
+      lines[0] = firstLine.substring(0, braceIdx + 1) + newKey + firstLine.substring(commaIdx);
     }
-  });
+    // Find the title line index
+    var titleLineIdx = -1;
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf("title = {") >= 0) { titleLineIdx = i; break; }
+    }
+    // Build new lines array without old shorthand/shorttitle, then add new ones
+    var newLines = [];
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf("shorthand = {") >= 0) continue;
+      if (lines[i].indexOf("shorttitle = {") >= 0) continue;
+      if (i === titleLineIdx) {
+        if (sh) newLines.push(TAB + "shorthand = {" + sh + "},");
+        if (st) newLines.push(TAB + "shorttitle = {" + st + "},");
+      }
+      newLines.push(lines[i]);
+    }
+    currentBib = newLines.join(NL);
+    document.getElementById("bibPreview").textContent = currentBib;
+  }
+
+  document.getElementById("keyInput").addEventListener("input", rebuildBib);
+  document.getElementById("shorthandInput").addEventListener("input", rebuildBib);
+  document.getElementById("shorttitleInput").addEventListener("input", rebuildBib);
 
   document.getElementById("btnInsert").addEventListener("click", () => {
     vscode.postMessage({ type: "insert", bib: currentBib });

@@ -565,14 +565,24 @@ LIMIT 1
 SEARCH_QUERY = """
 PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 
-SELECT ?celex ?ecli ?date ?parties ?caseNumber ?resource_type
+SELECT DISTINCT ?celex ?ecli ?date ?title ?short_parties ?caseNumber ?resource_type
 WHERE {{
   ?work cdm:resource_legal_id_celex ?celex .
   FILTER(REGEX(STR(?celex), "^6[0-9]{{4}}(CJ|TJ|FJ|CC)"))
   ?expr cdm:expression_belongs_to_work ?work ;
-        cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> ;
-        cdm:expression_title ?parties .
-  FILTER(CONTAINS(LCASE(STR(?parties)), "{search_lower}"))
+        cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .
+  OPTIONAL {{ ?expr cdm:expression_title ?title . }}
+  OPTIONAL {{ ?expr cdm:expression_case-law_parties ?short_parties . }}
+  {{
+    ?expr cdm:expression_title ?searchText .
+    FILTER(CONTAINS(LCASE(STR(?searchText)), "{search_lower}"))
+  }} UNION {{
+    ?expr cdm:expression_case-law_parties ?searchParties .
+    FILTER(CONTAINS(LCASE(STR(?searchParties)), "{search_lower}"))
+  }} UNION {{
+    ?expr cdm:expression_case-law_indicator_decision ?searchHeadnote .
+    FILTER(CONTAINS(LCASE(STR(?searchHeadnote)), "{search_lower}"))
+  }}
   OPTIONAL {{ ?work cdm:case-law_ecli ?ecli . }}
   OPTIONAL {{ ?work cdm:work_date_document ?date . }}
   OPTIONAL {{ ?work cdm:resource_legal_number_natural_celex ?caseNumber . }}
@@ -743,22 +753,54 @@ def eu_lookup_by_celex(celex: str) -> Optional[dict]:
 
 
 def eu_search(query: str, limit: int = 10) -> list:
-    """Search EU case law by keyword (includes AG opinions)."""
+    """Search EU case law by keyword (includes AG opinions).
+    
+    If query looks like a case number (C-21/23), does a direct CELEX
+    lookup instead of a slow text search.
+    """
+    # Shortcut: if query looks like a case number, convert to CELEX and do direct lookup
+    case_num_match = re.match(r'^[CT][_-]?\d+/\d{2,4}(?:\s*P)?$', query.strip(), re.IGNORECASE)
+    if case_num_match:
+        celex = _celex_from_case_number(query.strip())
+        if celex:
+            result = eu_lookup_by_celex(celex)
+            if result:
+                return [result]
+            # Also try CC suffix for AG opinion
+            alt_celex = celex[:5] + "CC" + celex[7:]
+            result = eu_lookup_by_celex(alt_celex)
+            if result:
+                return [result]
+
     results = _sparql_query(SEARCH_QUERY.format(
         search_lower=query.lower().replace('"', '\\"'),
         limit=limit,
     ))
+    seen = set()
     cases = []
     for r in results:
         celex = r.get("celex", {}).get("value", "")
+        if celex in seen:
+            continue
+        seen.add(celex)
+
         ecli = r.get("ecli", {}).get("value", "")
         date = r.get("date", {}).get("value", "")
-        title_raw = r.get("parties", {}).get("value", "")
+        title_raw = r.get("title", {}).get("value", "")
+        short_parties = r.get("short_parties", {}).get("value", "")
         case_num = r.get("caseNumber", {}).get("value", "")
         resource_type = r.get("resource_type", {}).get("value", "")
 
-        parsed = _parse_eu_title(title_raw)
-        parties = parsed["parties"] or title_raw
+        # Prefer the short parties field if available
+        if short_parties:
+            parties = short_parties.strip().rstrip(".")
+            parsed = _parse_eu_title(title_raw)
+            case_number = parsed["case_number"] or case_num
+        else:
+            parsed = _parse_eu_title(title_raw)
+            parties = parsed["parties"] or title_raw
+            parties = parties.strip().rstrip(".")
+            case_number = parsed["case_number"] or case_num
 
         if ecli.startswith("ECLI:"):
             ecli = ecli[5:]
@@ -769,8 +811,8 @@ def eu_search(query: str, limit: int = 10) -> list:
             "celex": celex,
             "ecli": ecli,
             "date": date,
-            "case_number": parsed["case_number"] or case_num,
-            "title": parties.strip().rstrip("."),
+            "case_number": case_number,
+            "title": parties,
             "source": "eu",
             "is_ag_opinion": is_ag,
         })

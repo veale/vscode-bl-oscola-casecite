@@ -221,6 +221,10 @@ patterns no longer work.
 - **CELLAR SPARQL**: https://publications.europa.eu/webapi/rdf/sparql
 - **EUR-Lex search**: https://eur-lex.europa.eu/content/help/eurlex-content/search-tips.html
 
+## To package
+
+`vsce package --allow-missing-repository`
+
 ## Licence
 
 MIT
