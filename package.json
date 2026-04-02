@@ -2,7 +2,7 @@
   "name": "casecite",
   "displayName": "CaseCite — UK & EU Case Law for BibLaTeX",
   "description": "Search UK (National Archives), EU (CELLAR/EUR-Lex), and ECHR (HUDOC) case law and legislation, and insert @jurisdiction / @legislation biblatex entries with OSCOLA-compatible formatting.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "mveale",
   "repository": "https://github.com/veale/vscode-bl-oscola-casecite/",
   "icon": "icon.png",

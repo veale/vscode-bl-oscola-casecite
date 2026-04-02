@@ -1593,7 +1593,10 @@ def uk_legislation_search(query: str, limit: int = 15) -> list:
         req = urllib.request.Request(url, headers={"Accept": "application/xhtml+xml, text/html"})
         # Don't follow redirects — we want the 300 Multiple Choices response
         # or the 301 redirect to a single result
-        opener = urllib.request.build_opener(urllib.request.HTTPHandler)
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+        opener = urllib.request.build_opener(_NoRedirect)
 
         try:
             resp = opener.open(req, timeout=15)

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 scripts/casecite.py --json search \"Computer Misuse Act\" --source ukleg --limit 5)",
+      "Bash(python3 scripts/casecite.py --json search \"Computer Misuse Act 1990\" --source ukleg --limit 5)",
+      "Bash(python3 scripts/casecite.py --json search \"Data Protection\" --source ukleg --limit 5)"
+    ]
+  }
+}
